@@ -1,6 +1,7 @@
 import os
 import argparse
 import numpy as np
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
 import torch
 import torch.backends.cudnn
@@ -94,8 +95,10 @@ def main() -> None:
     torch.cuda.set_device(dist.local_rank())
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('config', metavar='FILE', help='config file')
-    parser.add_argument('--checkpoint_path', help='checkpoint_path')
+    parser.add_argument('--config', default="/home/SemanticSTFV2/PointDR/configs/kitti2stf/minkunet/cr0p5.yaml",
+                        help='config file')
+    parser.add_argument('--checkpoint_path', default="/home/SemanticSTFV2/runs/semantickitti-to-semanticstf.pt",
+                        help='checkpoint_path')
     parser.add_argument('--name', type=str, default='minkunet', help='model name')
     args, opts = parser.parse_known_args()
 

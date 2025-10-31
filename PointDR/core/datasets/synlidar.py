@@ -58,7 +58,7 @@ class SynLiDARInternal:
         files.append(self.files[ii])
       self.files = files
 
-    DATA = yaml.safe_load(open('core/datasets/mapping/synlidar.yaml', 'r'))
+    DATA = yaml.safe_load(open('/home/SemanticSTFV2/PointDR/core/datasets/mapping/synlidar.yaml', 'r'))
     remap_dict = DATA["learning_map"]
     max_key = max(remap_dict.keys())
     remap_lut = np.ones((max_key + 100), dtype=np.int32) * 255

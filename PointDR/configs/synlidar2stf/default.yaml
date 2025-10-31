@@ -9,13 +9,13 @@ train:
 
 src_dataset:
   name: synlidar
-  root: /data/datasets/SynLiDAR/SubSet/sequences
+  root: /home/dataset/SynLiDAR
   num_points: 80000
   voxel_size: 0.05
 
 tgt_dataset:
   name: semanticstf
-  root: /data/dataset/SemanticSTF
+  root: /home/dataset/SemanticSTF
   num_points: 80000
   voxel_size: 0.05
 
