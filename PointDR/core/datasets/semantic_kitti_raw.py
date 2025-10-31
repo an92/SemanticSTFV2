@@ -1,0 +1,218 @@
+import os
+
+import numpy as np
+from torchsparse import SparseTensor
+from torchsparse.utils.collate import sparse_collate_fn
+from torchsparse.utils.quantize import sparse_quantize
+from torchpack.utils.logging import logger
+
+__all__ = ['SemanticRawKITTI']
+
+label_name_mapping = {
+    0: 'unlabeled',
+    1: 'outlier',
+    10: 'car',
+    11: 'bicycle',
+    13: 'bus',
+    15: 'motorcycle',
+    16: 'on-rails',
+    18: 'truck',
+    20: 'other-vehicle',
+    30: 'person',
+    31: 'bicyclist',
+    32: 'motorcyclist',
+    40: 'road',
+    44: 'parking',
+    48: 'sidewalk',
+    49: 'other-ground',
+    50: 'building',
+    51: 'fence',
+    52: 'other-structure',
+    60: 'lane-marking',
+    70: 'vegetation',
+    71: 'trunk',
+    72: 'terrain',
+    80: 'pole',
+    81: 'traffic-sign',
+    99: 'other-object',
+    252: 'moving-car',
+    253: 'moving-bicyclist',
+    254: 'moving-person',
+    255: 'moving-motorcyclist',
+    256: 'moving-on-rails',
+    257: 'moving-bus',
+    258: 'moving-truck',
+    259: 'moving-other-vehicle'
+}
+
+kept_labels = [
+    'road', 'sidewalk', 'parking', 'other-ground', 'building', 'car', 'truck',
+    'bicycle', 'motorcycle', 'other-vehicle', 'vegetation', 'trunk', 'terrain',
+    'person', 'bicyclist', 'motorcyclist', 'fence', 'pole', 'traffic-sign'
+]
+
+
+class SemanticRawKITTI(dict):
+
+    def __init__(self, root, voxel_size, num_points, **kwargs):
+        submit_to_server = kwargs.get('submit', False)
+        sample_stride = kwargs.get('sample_stride', 1)
+        google_mode = kwargs.get('google_mode', False)
+
+        logger.info("SKT")
+
+        if submit_to_server:
+            super().__init__({
+                'train':
+                    SemanticRawKITTIInternal(root,
+                                          voxel_size,
+                                          num_points,
+                                          sample_stride=1,
+                                          split='train',
+                                          submit=True),
+                'test':
+                    SemanticRawKITTIInternal(root,
+                                          voxel_size,
+                                          num_points,
+                                          sample_stride=1,
+                                          split='test')
+            })
+        else:
+            super().__init__({
+                'train':
+                    SemanticRawKITTIInternal(root,
+                                          voxel_size,
+                                          num_points,
+                                          sample_stride=1,
+                                          split='train',
+                                          google_mode=google_mode),
+                'test':
+                    SemanticRawKITTIInternal(root,
+                                          voxel_size,
+                                          num_points,
+                                          sample_stride=sample_stride,
+                                          split='val')
+            })
+
+
+class SemanticRawKITTIInternal:
+
+    def __init__(self,
+                 root,
+                 voxel_size,
+                 num_points,
+                 split,
+                 sample_stride=1,
+                 submit=False,
+                 google_mode=True):
+        if submit:
+            trainval = True
+        else:
+            trainval = False
+        self.root = root
+        self.split = split
+        self.voxel_size = voxel_size
+        self.num_points = num_points
+        self.sample_stride = sample_stride
+        self.google_mode = google_mode
+        self.seqs = []
+        if split == 'train':
+            self.seqs = [
+                '00', '01', '02', '03', '04', '05', '06', '07', '09', '10'
+            ]
+            if self.google_mode or trainval:
+                self.seqs.append('08')
+        elif self.split == 'val':
+            self.seqs = ['08']
+        elif self.split == 'test':
+            self.seqs = [
+                '11', '12', '13', '14', '15', '16', '17', '18', '19', '20', '21'
+            ]
+
+        self.files = []
+        for seq in self.seqs:
+            seq_files = sorted(
+                os.listdir(os.path.join(self.root, seq, 'velodyne')))
+            seq_files = [
+                os.path.join(self.root, seq, 'velodyne', x) for x in seq_files
+            ]
+            self.files.extend(seq_files)
+
+        if self.sample_stride > 1:
+            self.files = self.files[::self.sample_stride]
+
+        reverse_label_name_mapping = {}
+        self.label_map = np.zeros(260)
+        cnt = 0
+        for label_id in label_name_mapping:
+            if label_id > 250:
+                if label_name_mapping[label_id].replace('moving-',
+                                                        '') in kept_labels:
+                    self.label_map[label_id] = reverse_label_name_mapping[
+                        label_name_mapping[label_id].replace('moving-', '')]
+                else:
+                    self.label_map[label_id] = 255
+            elif label_id == 0:
+                self.label_map[label_id] = 255
+            else:
+                if label_name_mapping[label_id] in kept_labels:
+                    self.label_map[label_id] = cnt
+                    reverse_label_name_mapping[
+                        label_name_mapping[label_id]] = cnt
+                    cnt += 1
+                else:
+                    self.label_map[label_id] = 255
+
+        self.reverse_label_name_mapping = reverse_label_name_mapping
+        self.num_classes = cnt
+        self.angle = 0.0
+
+    def set_angle(self, angle):
+        self.angle = angle
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, index):
+        with open(self.files[index], 'rb') as b:
+            block_ = np.fromfile(b, dtype=np.float32).reshape(-1, 4)
+        # read labels
+        label_file = self.files[index].replace('velodyne', 'labels').replace('.bin', '.label')
+        if os.path.exists(label_file):
+            with open(label_file, 'rb') as a:
+                all_labels = np.fromfile(a, dtype=np.int32).reshape(-1)
+        else:
+            all_labels = np.zeros(block_.shape[0]).astype(np.int32)
+        labels_ = self.label_map[all_labels & 0xFFFF].astype(np.int64)
+
+        block_1 = block_.copy()
+
+        # voxelization
+        pc_1_ = np.round(block_1[:, :3] / self.voxel_size).astype(np.int32)
+        pc_1_ -= pc_1_.min(0, keepdims=1)
+
+        feat_1_ = block_1
+        _, inds_1, inverse_map = sparse_quantize(pc_1_,
+                                                 return_index=True,
+                                                 return_inverse=True)
+        if len(inds_1) > self.num_points:
+            inds_1 = np.random.choice(inds_1, self.num_points, replace=False)  # Note this step causes cuda problem if evaluating
+
+        pc_1 = pc_1_[inds_1]
+        feat_1 = feat_1_[inds_1]
+        labels_1 = labels_[inds_1]
+        lidar_1 = SparseTensor(feat_1, pc_1)
+        labels_1 = SparseTensor(labels_1, pc_1)
+        inverse_map = SparseTensor(inverse_map, pc_1_)
+
+        return {
+            'lidar': lidar_1,
+            'targets': labels_1,
+            'inverse_map_dense': inverse_map,
+            'file_name': self.files[index],
+        }
+
+
+    @staticmethod
+    def collate_fn(inputs):
+        return sparse_collate_fn(inputs)

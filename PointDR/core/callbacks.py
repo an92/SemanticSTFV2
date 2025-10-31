@@ -34,6 +34,8 @@ class MeanIoU(Callback):
         outputs = outputs[targets != self.ignore_label]
         targets = targets[targets != self.ignore_label]
 
+        if targets.device != outputs.device:
+            targets = targets.to(outputs.device)
         for i in range(self.num_classes):
             self.total_seen[i] += torch.sum(targets == i).item()
             self.total_correct[i] += torch.sum((targets == i)

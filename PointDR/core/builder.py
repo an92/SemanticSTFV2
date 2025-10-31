@@ -21,6 +21,14 @@ def get_kitti(phase):
                             voxel_size=dataset_config.voxel_size)
     return dataset[phase]
 
+def get_raw_kitti(phase):
+    from core.datasets import SemanticRawKITTI
+    dataset_config = configs.src_dataset if phase == 'train' else configs.tgt_dataset
+    dataset = SemanticRawKITTI(root=dataset_config.root,
+                            num_points=dataset_config.num_points,
+                            voxel_size=dataset_config.voxel_size)
+    return dataset[phase]
+
 
 def get_synlidar():
     from core.datasets import SynLiDAR
@@ -47,6 +55,8 @@ def make_dataset() -> Dataset:
         src_dataset = get_synlidar()
     elif configs.src_dataset.name == 'semantickitti':
         src_dataset = get_kitti(phase='train')
+    elif configs.src_dataset.name == 'semanticRawkitti':
+        src_dataset = get_raw_kitti(phase='train')
     elif configs.src_dataset.name == 'semanticstf':
         src_dataset = get_stf(phase='train')
     else:
@@ -74,6 +84,13 @@ def make_model() -> nn.Module:
         else:
             cr = 1.0
         model = MinkUNet(num_classes=configs.data.num_classes, cr=cr)
+    elif configs.model.name == 'raw_minkunet':
+        from core.models.semantic_kitti import MinkUNet as RawMinkUNet
+        if 'cr' in configs.model:
+            cr = configs.model.cr
+        else:
+            cr = 1.0
+        model = RawMinkUNet(num_classes=configs.data.num_classes, cr=cr)
     else:
         raise NotImplementedError(configs.model.name)
     return model
