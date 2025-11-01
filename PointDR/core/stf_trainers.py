@@ -47,9 +47,9 @@ class STFTrainer(Trainer):
 
         # DUACL & CSCG 超参数
         self.lamda_uacl = 0.1  # DUACL 损失权重 (原 lamda)
-        self.lamda_struc = 0.01  # CSCG 结构损失权重 (新增)
+        self.lamda_struc = 0.1  # CSCG 结构损失权重
         self.T = 0.07  # InfoNCE 温度
-        self.uacl_weight_scale = 0.5  # DUACL 不确定性权重缩放因子
+        self.uacl_weight_scale = 1.0  # DUACL 不确定性权重缩放因子
         self.IGNORE_LABEL = 255  # 假设的忽略标签
         # 假设 configs.data.num_classes 已经被正确设置（例如 19）
         self.NUM_CLASSES = configs.data.num_classes
@@ -145,9 +145,7 @@ class STFTrainer(Trainer):
                     feat2_proto_batch[ii] = feat_2[mask].mean(dim=0)
             feat2_proto_batch = nn.functional.normalize(feat2_proto_batch, dim=1)
             P_current = torch.mm(feat2_proto_batch, feat2_proto_batch.T)
-            P_current = P_current / P_current.size(1)  # 归一化
 
-            # 3. 结构损失 L_SSSA (MSE)
             loss_struc = nn.functional.mse_loss(P_current, P_struct)
 
             # momentum update memory bank
