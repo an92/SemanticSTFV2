@@ -17,7 +17,7 @@ from torchpack.callbacks import InferenceRunner, MaxSaver, Saver
 from torchpack.environ import set_run_dir
 from torchpack.utils.config import configs
 from torchpack.utils.logging import logger
-from PointDR.core.stf_v2_trainers import STFV2Trainer
+from PointDR.core.stf_v3_trainers import STFV3Trainer
 from PointDR.tools.util import auto_time_set_run_dir
 
 from core import builder
@@ -84,7 +84,7 @@ def main() -> None:
     optimizer = builder.make_optimizer(model)
     scheduler = builder.make_scheduler(optimizer)
 
-    trainer = STFV2Trainer(model=model,
+    trainer = STFV3Trainer(model=model,
                                  criterion=criterion,
                                  optimizer=optimizer,
                                  scheduler=scheduler,

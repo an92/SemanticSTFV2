@@ -20,10 +20,10 @@ from core.callbacks import MeanIoU
 import pdb
 import tqdm
 
-__all__ = ['STFV2Trainer']
+__all__ = ['STFV3Trainer']
 
 
-class STFV2Trainer(Trainer):
+class STFV3Trainer(Trainer):
 
     def __init__(self,
                  model: nn.Module,
@@ -45,21 +45,27 @@ class STFV2Trainer(Trainer):
 
         self.eval_interval = 500
 
-        # DUACL & CSCG 超参数
-        self.lamda_uacl = 0.1  # DUACL 损失权重 (原 lamda)
-        self.lamda_struc = 0.1  # CSCG 结构损失权重
+        # DUACL & CSCG 基础超参数
+        self.lamda_uacl = 0.1  # DUACL 损失权重 (目标值)
+        self.lamda_struc = 0.1  # CSCG 结构损失权重 (起始值)
+        self.lamda_struc_target = 0.2  # CSCG 结构损失权重 (目标值, 增强)
         self.T = 0.07  # InfoNCE 温度
-        self.uacl_weight_scale = 1.0  # DUACL 不确定性权重缩放因子 (用于L2距离)
+        self.uacl_weight_scale = 1.0  # DUACL 不确定性权重缩放因子
 
-        # *** 改进点：动态 alpha 调整的起始和结束值 ***
-        self.uacl_alpha_dist_start = 0.3  # L2 距离权重起始比例 (倾向 Entropy)
-        self.uacl_alpha_dist_end = 0.7  # L2 距离权重结束比例 (倾向 L2 Distance)
+        # *** 动态 alpha 调整 ***
+        self.uacl_alpha_dist_start = 0.3
+        self.uacl_alpha_dist_end = 0.7
 
-        self.IGNORE_LABEL = 255  # 假设的忽略标签
+        self.IGNORE_LABEL = 255
         self.NUM_CLASSES = configs.data.num_classes
 
         # 假设总步数来自 config
         self.MAX_STEPS = getattr(configs.train, 'max_steps', 1000000)
+
+        # *** 性能增强设置 ***
+        self.warmup_steps = int(self.MAX_STEPS * 0.1)  # UACL/CSCG 预热步数 (前 10%)
+        self.N_min = 100  # CSCG 结构损失的最小点数阈值
+        self.CONF_THRESHOLD = 0.95  # 弱视图原型过滤的置信度阈值
 
     def _before_epoch(self) -> None:
         self.model.train()
@@ -95,10 +101,18 @@ class STFV2Trainer(Trainer):
 
             # 弱视图特征聚合 (Prototypes from X^w)
             feat1_proto = torch.zeros((self.NUM_CLASSES, feat_1.shape[1])).cuda()
+
+            # *** 性能增强 1: X^w 原型的高置信度过滤 ***
+            probs_1, _ = nn.functional.softmax(outputs_1, dim=1).max(dim=1)
+
             for ii in range(self.NUM_CLASSES):
-                mask = (targets_1 == ii)
-                if mask.sum():
-                    feat1_proto[ii] = feat_1[mask].mean(dim=0)
+                label_mask = (targets_1 == ii)
+                conf_mask = (probs_1 > self.CONF_THRESHOLD)
+                # 仅使用高置信度的点来计算原型
+                final_mask = label_mask & conf_mask
+
+                if final_mask.sum():
+                    feat1_proto[ii] = feat_1[final_mask].mean(dim=0)
             feat1_proto = (feat1_proto + 1e-8).cuda()
 
             # 不确定性 U_i 估计和动态权重 W_i 计算
@@ -108,15 +122,13 @@ class STFV2Trainer(Trainer):
                 # --- A. L2 距离不确定性 (W_dist) ---
                 feat2_proto_map = torch.zeros_like(feat_2)
 
-                # *** 核心修改一：使用 Memory Bank 的稳定原型 M_proto ***
+                # *** 稳定原型: 使用 Memory Bank 的稳定原型 M_proto (已修复转置) ***
                 M_proto = self.model.memo_bank.T.detach()
-                # 假设 M_proto 的形状是 [Feat_Dim, Num_Classes]，需要转置为 [Num_Classes, Feat_Dim]
-                M_proto_T = M_proto.T
+                M_proto_T = M_proto.T  # [Num_Classes, Feat_Dim]
 
                 for ii in range(self.NUM_CLASSES):
                     mask = (targets_2 == ii)
                     if mask.sum():
-                        # 使用转置后的 Memory Bank 原型，并用 unsqueeze(0) 进行广播
                         feat2_proto_map[mask] = M_proto_T[ii].unsqueeze(0)
 
                 # U_i: L2 距离作为不确定性代理
@@ -128,17 +140,13 @@ class STFV2Trainer(Trainer):
 
                 # --- B. 预测熵不确定性 (W_entropy) ---
                 probs_2 = nn.functional.softmax(pred_2, dim=1)[valid_mask_2]
-                log_probs_2 = torch.log(probs_2 + 1e-8)  # 避免log(0)
-                H_i = -torch.sum(probs_2 * log_probs_2, dim=1)  # 熵
+                log_probs_2 = torch.log(probs_2 + 1e-8)
+                H_i = -torch.sum(probs_2 * log_probs_2, dim=1)
                 H_i_normalized = H_i / (H_i.mean() + 1e-8)
                 W_entropy = 1.0 + self.uacl_weight_scale * H_i_normalized
 
-                # --- C. 融合动态权重 W_i *** 核心修改二：动态 alpha 调整 ***
-
-                # 计算当前训练进度比例 (0.0 到 1.0)
+                # --- C. 融合动态权重 W_i *** 动态 alpha 调整 ***
                 progress = (self.global_step / self.MAX_STEPS)
-
-                # 动态调整 alpha: 从 start (倾向Entropy) 线性过渡到 end (倾向L2 Distance)
                 current_alpha_dist = self.uacl_alpha_dist_start + \
                                      (self.uacl_alpha_dist_end - self.uacl_alpha_dist_start) * progress
                 current_alpha_dist = min(current_alpha_dist, self.uacl_alpha_dist_end)
@@ -167,24 +175,61 @@ class STFV2Trainer(Trainer):
             P_struct = nn.functional.normalize(P_struct, dim=1)
 
             feat2_proto_batch = torch.zeros((self.NUM_CLASSES, feat_2.shape[1])).cuda()
+            class_counts_2 = torch.zeros(self.NUM_CLASSES, device=feat_2.device)  # 记录点数
+
             for ii in range(self.NUM_CLASSES):
                 mask = (targets_2 == ii)
-                if mask.sum():
+                count = mask.sum()
+                class_counts_2[ii] = count
+                if count:
                     feat2_proto_batch[ii] = feat_2[mask].mean(dim=0)
+
             feat2_proto_batch = nn.functional.normalize(feat2_proto_batch, dim=1)
             P_current = torch.mm(feat2_proto_batch, feat2_proto_batch.T)
 
-            loss_struc = nn.functional.mse_loss(P_current, P_struct)
+            # *** 性能增强 2: 动态 CSCG 权重掩码 ***
+            stable_classes_mask = (class_counts_2 > self.N_min).float()
+            W_struct = torch.outer(stable_classes_mask, stable_classes_mask)
+
+            num_valid_rels = W_struct.sum()
+
+            if num_valid_rels > 0:
+                # 仅对稳定类别之间的关系计算 MSE Loss，并进行平均
+                loss_struc = (W_struct * nn.functional.mse_loss(P_current, P_struct,
+                                                                reduction='none')).sum() / num_valid_rels
+            else:
+                loss_struc = torch.tensor(0.0, device=feat_1.device)
+            # ---------------------------------------------
 
             # momentum update memory bank
             self.model.momentum_update_key_encoder(feat1_proto, init=(self.global_step == 1))
 
-            loss = loss_ce + self.lamda_uacl * loss_uacl + self.lamda_struc * loss_struc
+            # *** 性能增强 3 & 4: 动态 lambda 调整 ***
+
+            # (A) DUACL 预热
+            current_lamda_uacl = self.lamda_uacl
+            if self.global_step < self.warmup_steps:
+                warmup_ratio = self.global_step / self.warmup_steps
+                current_lamda_uacl = self.lamda_uacl * warmup_ratio
+
+            # (B) CSCG 结构损失增强
+            current_lamda_struc = self.lamda_struc
+            # 假设在 30% 之后开始线性增强结构损失
+            struc_start_step = int(self.MAX_STEPS * 0.3)
+            if self.global_step > struc_start_step:
+                struc_progress = min(1.0,
+                                     (self.global_step - struc_start_step) / (self.MAX_STEPS - struc_start_step + 1e-8))
+                current_lamda_struc = self.lamda_struc + (self.lamda_struc_target - self.lamda_struc) * struc_progress
+
+            loss = loss_ce + current_lamda_uacl * loss_uacl + current_lamda_struc * loss_struc
 
             self.summary.add_scalar('loss', loss.item())
             self.summary.add_scalar('loss_ce', loss_ce.item())
             self.summary.add_scalar('loss_uacl', loss_uacl.item())
             self.summary.add_scalar('loss_struc', loss_struc.item())
+            self.summary.add_scalar('current_lamda_uacl', current_lamda_uacl)  # 监控动态权重
+            self.summary.add_scalar('current_lamda_struc', current_lamda_struc)  # 监控动态权重
+            self.summary.add_scalar('alpha_dist', current_alpha_dist)  # 监控动态alpha
 
             self.optimizer.zero_grad()
             self.scaler.scale(loss).backward()
