@@ -1,11 +1,10 @@
 import argparse
 import random
 import sys
-import os
 
 from PointDR.tools.util import auto_time_set_run_dir
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+# os.environ["CUDA_VISIBLE_DEVICES"] = "5"
 
 import numpy as np
 import torch
@@ -19,14 +18,14 @@ from torchpack.environ import set_run_dir
 from torchpack.utils.config import configs
 from torchpack.utils.logging import logger
 
-from PointDR.core.stf_trainers import STFTrainer
+from core.trainers import SemanticSTFTrainer
 from core import builder
 from core.callbacks import MeanIoU
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument('--config', default='/home/SemanticSTFV2/PointDR/configs/kitti2stf/minkunet/cr0p5.yaml', help='config file')
+    parser.add_argument('--config', default='/home/SemanticSTFV2/PointDR/configs/aug_pointdr.yaml', help='config file')
     parser.add_argument('--run-dir', help='run directory')
     args, opts = parser.parse_known_args()
 
@@ -84,7 +83,7 @@ def main() -> None:
     optimizer = builder.make_optimizer(model)
     scheduler = builder.make_scheduler(optimizer)
 
-    trainer = STFTrainer(model=model,
+    trainer = SemanticSTFTrainer(model=model,
                                  criterion=criterion,
                                  optimizer=optimizer,
                                  scheduler=scheduler,
