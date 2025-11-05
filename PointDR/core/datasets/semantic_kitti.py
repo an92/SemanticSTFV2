@@ -292,9 +292,52 @@ class SemanticKITTIInternal:
             'targets_2': labels_2
         }
 
+    def return_single_view(self, index):
+        with open(self.files[index], 'rb') as b:
+            block_ = np.fromfile(b, dtype=np.float32).reshape(-1, 4)
+        # read labels
+        pc_ = np.round(block_[:, :3] / self.voxel_size).astype(np.int32)
+        pc_ -= pc_.min(0, keepdims=1)
+
+        label_file = self.files[index].replace('velodyne', 'labels').replace('.bin', '.label')
+        if os.path.exists(label_file):
+            with open(label_file, 'rb') as a:
+                all_labels = np.fromfile(a, dtype=np.int32).reshape(-1)
+        else:
+            all_labels = np.zeros(pc_.shape[0]).astype(np.int32)
+
+        labels_ = self.label_map[all_labels & 0xFFFF].astype(np.int64)
+
+        _, inds, inverse_map = sparse_quantize(pc_, return_index=True, return_inverse=True)
+
+        if 'train' in self.split:
+            if len(inds) > self.num_points:
+                inds = np.random.choice(inds, self.num_points, replace=False)
+
+        pc = pc_[inds]
+        feat = block_[inds]
+        labels = labels_[inds]
+
+        lidar = SparseTensor(feat, pc)
+        labels = SparseTensor(labels, pc)
+        labels_ = SparseTensor(labels_, pc_)
+        inverse_map = SparseTensor(inverse_map, pc_)
+
+        return {
+            'lidar': lidar,
+            'targets': labels,
+            'targets_mapped': labels_,
+            'inverse_map': inverse_map,
+
+            'file_name': self.files[index]
+        }
+
     def __getitem__(self, index):
        # return double views for contrastive learning
-       return self.return_double_views(index)
+       if self.split in ['val', 'test']:
+           return self.return_single_view(index)
+       else:
+           return self.return_double_views(index)
 
 
     @staticmethod

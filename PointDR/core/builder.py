@@ -67,6 +67,8 @@ def make_dataset() -> Dataset:
         tgt_dataset = get_kitti(phase='test')
     elif configs.tgt_dataset.name == 'semanticstf':
         tgt_dataset = get_stf()
+    elif configs.src_dataset.name == 'semanticRawkitti':
+        tgt_dataset = get_raw_kitti(phase='test')
     else:
         raise NotImplementedError(configs.dataset.name)
 

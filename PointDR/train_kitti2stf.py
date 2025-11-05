@@ -22,7 +22,7 @@ from core.trainers import SemanticSTFTrainer
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', default='/home/SemanticSTFV2/PointDR/configs/kitti2stf/minkunet/cr0p5.yaml', help='config file')
-    parser.add_argument('--run-dir', default='/home/SemanticSTFV2/PointDR/runs/kitti2stf', help='run directory')
+    parser.add_argument('--run-dir', help='run directory')
     args, opts = parser.parse_known_args()
 
     configs.load(args.config, recursive=True)

@@ -59,8 +59,6 @@ class SemanticRawKITTI(dict):
         sample_stride = kwargs.get('sample_stride', 1)
         google_mode = kwargs.get('google_mode', False)
 
-        logger.info("SKT")
-
         if submit_to_server:
             super().__init__({
                 'train':
@@ -177,39 +175,40 @@ class SemanticRawKITTIInternal:
         with open(self.files[index], 'rb') as b:
             block_ = np.fromfile(b, dtype=np.float32).reshape(-1, 4)
         # read labels
+        pc_ = np.round(block_[:, :3] / self.voxel_size).astype(np.int32)
+        pc_ -= pc_.min(0, keepdims=1)
+
         label_file = self.files[index].replace('velodyne', 'labels').replace('.bin', '.label')
         if os.path.exists(label_file):
             with open(label_file, 'rb') as a:
                 all_labels = np.fromfile(a, dtype=np.int32).reshape(-1)
         else:
-            all_labels = np.zeros(block_.shape[0]).astype(np.int32)
+            all_labels = np.zeros(pc_.shape[0]).astype(np.int32)
+
         labels_ = self.label_map[all_labels & 0xFFFF].astype(np.int64)
 
-        block_1 = block_.copy()
+        _, inds, inverse_map = sparse_quantize(pc_, return_index=True, return_inverse=True)
 
-        # voxelization
-        pc_1_ = np.round(block_1[:, :3] / self.voxel_size).astype(np.int32)
-        pc_1_ -= pc_1_.min(0, keepdims=1)
+        if 'train' in self.split:
+            if len(inds) > self.num_points:
+                inds = np.random.choice(inds, self.num_points, replace=False)
 
-        feat_1_ = block_1
-        _, inds_1, inverse_map = sparse_quantize(pc_1_,
-                                                 return_index=True,
-                                                 return_inverse=True)
-        if len(inds_1) > self.num_points:
-            inds_1 = np.random.choice(inds_1, self.num_points, replace=False)  # Note this step causes cuda problem if evaluating
+        pc = pc_[inds]
+        feat = block_[inds]
+        labels = labels_[inds]
 
-        pc_1 = pc_1_[inds_1]
-        feat_1 = feat_1_[inds_1]
-        labels_1 = labels_[inds_1]
-        lidar_1 = SparseTensor(feat_1, pc_1)
-        labels_1 = SparseTensor(labels_1, pc_1)
-        inverse_map = SparseTensor(inverse_map, pc_1_)
+        lidar = SparseTensor(feat, pc)
+        labels = SparseTensor(labels, pc)
+        labels_ = SparseTensor(labels_, pc_)
+        inverse_map = SparseTensor(inverse_map, pc_)
 
         return {
-            'lidar': lidar_1,
-            'targets': labels_1,
-            'inverse_map_dense': inverse_map,
-            'file_name': self.files[index],
+            'lidar': lidar,
+            'targets': labels,
+            'targets_mapped': labels_,
+            'inverse_map': inverse_map,
+
+            'file_name': self.files[index]
         }
 
 
