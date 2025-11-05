@@ -59,6 +59,8 @@ class SemanticRawKITTI(dict):
         sample_stride = kwargs.get('sample_stride', 1)
         google_mode = kwargs.get('google_mode', False)
 
+        logger.info("SKT")
+
         if submit_to_server:
             super().__init__({
                 'train':
