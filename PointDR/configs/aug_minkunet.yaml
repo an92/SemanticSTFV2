@@ -4,7 +4,7 @@ data:
   training_size: 19132
 
 model:
-  name: minkunet
+  name: raw_minkunet
   cr: 0.5
 
 train:
@@ -12,22 +12,12 @@ train:
   deterministic: False
 
 src_dataset:
-  name: semanticAugkitti
+  name: semanticAugSinglekitti
   root: /home/dataset/SemanticKITTI/sequences
   num_points: 80000
   voxel_size: 0.05
 
-  # --- Weak Aug 流程 ---
-  weak_aug:
-    - name: rotate_scale         # 旋转和缩放
-      prob: 1.0
-      min_angle: 0.0
-      max_angle: 6.283185 # 2 * pi
-      min_scale: 0.95
-      max_scale: 1.05
-
-
-  # --- 定义 Strong Aug 流程---
+  # --- 定义 Aug 流程---
   strong_aug:
     - name: rotate_scale
       prob: 1.0

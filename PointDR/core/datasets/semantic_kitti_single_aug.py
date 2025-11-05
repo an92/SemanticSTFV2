@@ -65,15 +65,14 @@ AUG_MAP = {
     'add_random_noise_points': apply_add_noise_points,
 }
 
+
 class AugmentationPipeline:
-    def __init__(self, weak_steps: list, strong_steps: list, ignore_label: int = 255):
-        self.weak_steps = weak_steps
+
+    def __init__(self, strong_steps: list, ignore_label: int = 255):
         self.strong_steps = strong_steps
         self.ignore_label = ignore_label
 
-
-    def run_pipeline(self, block: np.ndarray, labels: np.ndarray, ids: np.ndarray, steps: list) -> Tuple[
-        np.ndarray, np.ndarray, np.ndarray]:
+    def run_pipeline(self, block: np.ndarray, labels: np.ndarray, ids: np.ndarray, steps: list) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         # 构造传递给增强函数的全局配置
         # 全局配置只包含 ignore_label
         pipeline_config = {'ignore_label': self.ignore_label}
@@ -119,25 +118,23 @@ class SingleAugSemanticKITTI(dict):
         weak_aug = kwargs.get('weak_aug', [])
         strong_aug = kwargs.get('strong_aug', [])
 
-
         super().__init__({
-            'train': SingleAugSemanticKITTIInternal(root, voxel_size, num_points, weak_aug, strong_aug, sample_stride=1, split='train'),
-            'test': SingleAugSemanticKITTIInternal(root, voxel_size, num_points,  weak_aug, strong_aug, sample_stride=sample_stride, split='val')
+            'train': SingleAugSemanticKITTIInternal(root, voxel_size, num_points, strong_aug, sample_stride=1, split='train'),
+            'test': SingleAugSemanticKITTIInternal(root, voxel_size, num_points, strong_aug, sample_stride=sample_stride, split='val')
         })
 
 
 class SingleAugSemanticKITTIInternal:
 
-    def __init__(self, root, voxel_size, num_points, weak_aug, strong_aug, sample_stride=1, split='train'):
+    def __init__(self, root, voxel_size, num_points, strong_aug, sample_stride=1, split='train'):
         self.root = root
         self.split = split
         self.voxel_size = voxel_size
         self.num_points = num_points
         self.sample_stride = sample_stride
 
-        self.weak_aug = weak_aug
         self.strong_aug = strong_aug
-        self.pipeline = AugmentationPipeline(weak_aug, strong_aug, ignore_label=255)
+        self.pipeline = AugmentationPipeline(strong_aug, ignore_label=255)
 
         self.seqs = []
         if split == 'train':
@@ -185,71 +182,54 @@ class SingleAugSemanticKITTIInternal:
     def __len__(self):
         return len(self.files)
 
-    def return_double_views(self, index):
+    def return_aug_single_views(self, index):
         with open(self.files[index], 'rb') as b:
             block_ = np.fromfile(b, dtype=np.float32).reshape(-1, 4)
-        # assign an id for each point for consistency
+
+        # **(与 __getitem__ 唯一的不同：添加 IDs 和增强调用)**
+        # 原始代码没有 ids，但在增强流水线中 ids 是必需的。
+        # 为了保持一致性，我们在读取后创建 ids，并在增强后丢弃它。
         ids = np.arange(block_.shape[0])
-        # read labels
+
         label_file = self.files[index].replace('velodyne', 'labels').replace('.bin', '.label')
         if os.path.exists(label_file):
             with open(label_file, 'rb') as a:
                 all_labels = np.fromfile(a, dtype=np.int32).reshape(-1)
         else:
             all_labels = np.zeros(block_.shape[0]).astype(np.int32)
+
         labels_ = self.label_map[all_labels & 0xFFFF].astype(np.int64)
 
-        # >>> Weak Augmented View (Anchor View) <<<
-        block_1, labels_1_, ids_1_ = self.pipeline.run_pipeline(block_.copy(), labels_.copy(), ids.copy(), self.pipeline.weak_steps)
+        block_, labels_, ids = self.pipeline.run_pipeline(
+            block_.copy(),
+            labels_.copy(),
+            ids.copy(),
+            self.pipeline.strong_steps
+        )
 
-        # Voxelization for View 1
-        pc_1_ = np.round(block_1[:, :3] / self.voxel_size).astype(np.int32)
-        pc_1_ -= pc_1_.min(0, keepdims=1)
+        pc_ = np.round(block_[:, :3] / self.voxel_size).astype(np.int32)
+        pc_ -= pc_.min(0, keepdims=True)
 
-        feat_1_ = block_1
-        _, inds_1, inverse_map = sparse_quantize(pc_1_, return_index=True, return_inverse=True)
-        if len(inds_1) > self.num_points:
-            inds_1 = np.random.choice(inds_1, self.num_points, replace=False)
+        _, inds, inverse_map = sparse_quantize(pc_, return_index=True, return_inverse=True)
 
-        pc_1 = pc_1_[inds_1]
-        feat_1 = feat_1_[inds_1]
-        labels_1 = labels_1_[inds_1]
-        ids_1 = ids_1_[inds_1]
-        lidar_1 = SparseTensor(feat_1, pc_1)
-        labels_1 = SparseTensor(labels_1, pc_1)
-        ids_1 = SparseTensor(ids_1, pc_1)
-        inverse_map = SparseTensor(inverse_map, pc_1_)
+        if len(inds) > self.num_points:
+            inds = np.random.choice(inds, self.num_points, replace=False)
 
-        # >>> Strong Augmented View (Positive View) <<<
-        block_2, labels_2_, ids_2_ = self.pipeline.run_pipeline(block_.copy(), labels_.copy(), ids.copy(), self.pipeline.strong_steps)
+        pc = pc_[inds]
+        feat = block_[inds]
+        labels = labels_[inds]
 
-        feat_2_ = block_2
-        pc_2_ = np.round(block_2[:, :3] / self.voxel_size).astype(np.int32)
-        pc_2_ -= pc_2_.min(0, keepdims=1)
-
-        _, inds_2, _ = sparse_quantize(pc_2_, return_index=True, return_inverse=True)
-
-        if len(inds_2) > self.num_points:
-            inds_2 = np.random.choice(inds_2, self.num_points, replace=False)
-
-        pc_2 = pc_2_[inds_2]
-        labels_2 = labels_2_[inds_2]
-        feat_2 = feat_2_[inds_2]
-        ids_2 = ids_2_[inds_2]
-
-        lidar_2 = SparseTensor(feat_2, pc_2)
-        labels_2 = SparseTensor(labels_2, pc_2)
-        ids_2 = SparseTensor(ids_2, pc_2)
+        lidar = SparseTensor(feat, pc)
+        labels = SparseTensor(labels, pc)
+        labels_ = SparseTensor(labels_, pc_)
+        inverse_map = SparseTensor(inverse_map, pc_)
 
         return {
-            'lidar': lidar_1,
-            'targets': labels_1,
-            'inverse_map_dense': inverse_map,
-            'file_name': self.files[index],
-            'ids_1': ids_1,
-            'lidar_2': lidar_2,
-            'ids_2': ids_2,
-            'targets_2': labels_2,
+            'lidar': lidar,
+            'targets': labels,
+            'targets_mapped': labels_,
+            'inverse_map': inverse_map,
+            'file_name': self.files[index]
         }
 
     def return_single_view(self, index):
@@ -283,14 +263,19 @@ class SingleAugSemanticKITTIInternal:
         labels_ = SparseTensor(labels_, pc_)
         inverse_map = SparseTensor(inverse_map, pc_)
 
-        return {'lidar': lidar, 'targets': labels, 'targets_mapped': labels_, 'inverse_map': inverse_map, 'file_name': self.files[index]}
+        return {
+            'lidar': lidar,
+            'targets': labels,
+            'targets_mapped': labels_,
+            'inverse_map': inverse_map,
+            'file_name': self.files[index],
+        }
 
     def __getitem__(self, index):
-        # return double views for contrastive learning
         if self.split in ['val', 'test']:
             return self.return_single_view(index)
         else:
-            return self.return_double_views(index)
+            return self.return_aug_single_views(index)
 
     @staticmethod
     def collate_fn(inputs):
