@@ -14,8 +14,8 @@ src_dataset:
   voxel_size: 0.05
 
 tgt_dataset:
-  name: semanticRawkitti
-  root: /home/dataset/SemanticKITTI/sequences
+  name: semanticstf
+  root: /home/dataset/SemanticSTF
   num_points: 80000
   voxel_size: 0.05
 

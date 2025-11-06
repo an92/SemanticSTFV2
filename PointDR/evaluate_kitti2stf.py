@@ -69,8 +69,10 @@ def main() -> None:
     torch.cuda.set_device(dist.local_rank())
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('--config', default="/home/SemanticSTFV2/PointDR/configs/kitti2stf/minkunet/cr0p5.yaml", help='config file')
-    parser.add_argument('--checkpoint_path', default="/home/SemanticSTFV2/runs/semantickitti-to-semanticstf.pt", help='checkpoint_path')
+    parser.add_argument('--config', default="/home/SemanticSTFV2/PointDR/configs/rawkitti2stf/minkunet/cr0p5.yaml",
+                        help='config file')
+    parser.add_argument('--checkpoint_path', default="/home/SemanticSTFV2/runs/run_62330647/checkpoints/max-iou-test.pt",
+                        help='checkpoint_path')
     parser.add_argument('--name', type=str, default='minkunet', help='model name')
     parser.add_argument('--save_pred', type=str, default=None, help='save prediction dir, do not save if none')
     args, opts = parser.parse_known_args()
@@ -93,8 +95,6 @@ def main() -> None:
             num_workers=configs.workers_per_gpu,
             pin_memory=True,
             collate_fn=dataset[split].collate_fn)
-
-    assert configs.model.name == 'minkunet'
 
     model = builder.make_model().cuda()
 
@@ -121,7 +121,9 @@ def main() -> None:
 
         inputs = _inputs['lidar']
         targets = feed_dict['targets'].F.long().cuda(non_blocking=True)
-        outputs, _ = model(inputs)
+        # outputs, _ = model(inputs)
+        outputs = model(inputs)
+
 
         invs = feed_dict['inverse_map']
         all_labels = feed_dict['targets_mapped']

@@ -2,7 +2,7 @@ import argparse
 import random
 import sys
 
-from PointDR.tools.util import auto_time_set_run_dir
+from PointDR.tools.util import auto_time_set_run_dir, BestEpochSaver, EpochSaver
 
 import numpy as np
 import torch
@@ -101,8 +101,8 @@ def main() -> None:
                 ],
             ) for split in ['test']
         ] + [
-            MaxSaver('iou/test'),
-            Saver(),
+            BestEpochSaver('iou/test', filename='best_epoch.pt'),
+            EpochSaver(),
         ])
 
 

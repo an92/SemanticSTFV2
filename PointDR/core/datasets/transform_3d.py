@@ -1,66 +1,69 @@
 import numpy as np
 from typing import Tuple, Dict, Any
-import open3d as o3d
+from numba import njit
+import faiss
+import sys
 
+@njit(cache=True)
+def _numba_pca_curvature(points_xyz: np.ndarray, all_indices: np.ndarray, curvatures: np.ndarray):
+    N = points_xyz.shape[0]
+    k = all_indices.shape[1]
 
-def calculate_local_curvature(block: np.ndarray, k_neighbors: int = 10) -> np.ndarray:
-    """
-    通过 Open3D 实现 K近邻搜索，然后使用标准的 NumPy 逐点计算局部曲率代理。
-    """
-    N = block.shape[0]
-    points_xyz = block[:, :3].astype('float32')
-
-    if N < k_neighbors:
-        return np.zeros(N, dtype=np.float32)
-
-    curvatures = np.zeros(N, dtype=np.float32)
-
-    # 1. Open3D: 构建点云对象和 KDTree，加速 KNN 搜索
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(points_xyz)
-    pcd_tree = o3d.geometry.KDTreeFlann(pcd)
-
-    # 2. Open3D: 搜索所有点的邻居索引
-    all_indices = []
-    for i in range(N):
-        [k, indices, _] = pcd_tree.search_knn_vector_3d(points_xyz[i], k_neighbors)
-        # 将 Open3D 返回的索引列表转换为 NumPy 数组
-        all_indices.append(np.asarray(indices, dtype=np.int64))
-
-    # 转换为 Numba/FAISS 版本中使用的二维 NumPy 数组结构
-    all_indices = np.array(all_indices, dtype=np.int64)
-
-    # 3. Python 循环: 逐点计算 PCA 和曲率
     for i in range(N):
         neighbor_indices = all_indices[i]
-        neighbor_pts = points_xyz[neighbor_indices, :]
 
-        if neighbor_pts.shape[0] < 3:
+        # 1. 提取邻居点
+        neighbor_pts = np.empty((k, 3), dtype=points_xyz.dtype)
+        for j in range(k):
+            neighbor_pts[j] = points_xyz[neighbor_indices[j]]
+
+        if k < 3:
             curvatures[i] = 0.0
             continue
 
-        # 质心和中心化
-        centroid = np.mean(neighbor_pts, axis=0)
+        # 2. 质心和中心化
+        centroid = np.sum(neighbor_pts, axis=0) / k
         centered_pts = neighbor_pts - centroid
 
-        # 协方差矩阵
-        if neighbor_pts.shape[0] > 1:
-            cov_matrix = np.cov(centered_pts, rowvar=False)
+        # 3. 协方差矩阵 (其余逻辑保持不变，因为它们是 Numba 支持的矩阵运算)
+        if k > 1:
+            cov_matrix = centered_pts.T @ centered_pts / (k - 1)
         else:
             curvatures[i] = 0.0
             continue
 
-        # 特征值分解
+        # 4. 特征值分解
         eigenvalues = np.linalg.eigvalsh(cov_matrix)
-        eigenvalues = np.sort(eigenvalues)[::-1]  # 从大到小排序
+        # 5. 排序: 从大到小
+        eigenvalues = np.sort(eigenvalues)[::-1]
 
-        # 计算曲率代理
-        sum_eigenvalues = np.sum(eigenvalues)
+        # 6. 计算曲率代理
+        sum_eigenvalues = eigenvalues[0] + eigenvalues[1] + eigenvalues[2]
         if sum_eigenvalues > 1e-6:
             curvatures[i] = eigenvalues[2] / sum_eigenvalues
         else:
             curvatures[i] = 0.0
 
+    return curvatures
+
+
+def calculate_local_curvature(block: np.ndarray, k_neighbors: int = 15) -> np.ndarray:
+    """使用 Faiss 进行批量 KNN 搜索，Numba 计算曲率。"""
+    N = block.shape[0]
+    points_xyz = block[:, :3].astype('float32')
+    if N < k_neighbors or 'faiss' not in sys.modules:
+        return np.zeros(N, dtype=np.float32)
+    curvatures = np.zeros(N, dtype=np.float32)
+    try:
+        points_xyz_faiss = np.ascontiguousarray(points_xyz)
+        index = faiss.IndexFlatL2(3)
+        index.add(points_xyz_faiss)
+        _, all_indices = index.search(points_xyz_faiss, k_neighbors)
+        all_indices = all_indices.astype(np.int64)
+    except Exception as e:
+        print(f"Faiss KNN search failed. Proceeding with zeros: {e}", file=sys.stderr)
+        return np.zeros(N, dtype=np.float32)
+    curvatures = _numba_pca_curvature(points_xyz, all_indices, curvatures)
     return curvatures.astype(np.float32)
 
 
@@ -144,58 +147,67 @@ def apply_add_noise_points(block: np.ndarray, labels: np.ndarray, ids: np.ndarra
 
 def apply_semantic_targeted_point_drop(block: np.ndarray, labels: np.ndarray, ids: np.ndarray,
                                        config: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """CL-RA S-TRPD: 语义-目标保留删减"""
+    """CL-RA LPD: 语义-目标保留删减（使用精简参数）。"""
     if block.shape[0] == 0: return block, labels, ids
 
     cfg = config['semantic_targeted_point_drop']
-    thing_class_ids = np.array(cfg['thing_class_ids'], dtype=labels.dtype)
+    thing_class_ids = np.array(cfg.get('thing_class_ids', []), dtype=labels.dtype)
+    base_drop_prob = cfg.get('base_drop_prob', 0.4)  # Stuff 类基础概率 (调优为 0.4)
+    thing_drop_ratio = cfg.get('thing_drop_ratio', 0.01)  # Thing 类相对概率 (调优为 0.01)
 
-    R = np.linalg.norm(block[:, :3], axis=1)
     is_thing = np.isin(labels, thing_class_ids)
     drop_probabilities = np.zeros(block.shape[0], dtype=np.float32)
 
-    P_base_stuff = cfg['max_drop_prob_stuff'] * 0.1
-    drop_probabilities[~is_thing] = np.clip(
-        P_base_stuff + cfg['depth_decay_factor'] * R[~is_thing], a_min=0, a_max=cfg['max_drop_prob_stuff']
-    )
-    drop_probabilities[is_thing] = cfg['max_drop_prob_things']
+    # Stuff 类 (背景) 应用基础删除概率
+    drop_probabilities[~is_thing] = base_drop_prob
+
+    # Thing 类 (目标) 应用低得多的删除概率
+    drop_probabilities[is_thing] = base_drop_prob * thing_drop_ratio
+
+    # 确保概率在 [0, 1] 范围内
+    drop_probabilities = np.clip(drop_probabilities, 0.0, 1.0)
 
     points_to_keep_mask = np.random.rand(block.shape[0]) > drop_probabilities
 
     return block[points_to_keep_mask], labels[points_to_keep_mask], ids[points_to_keep_mask]
 
-
 def apply_controlled_structure_jittering(block: np.ndarray, labels: np.ndarray, ids: np.ndarray,
                                          config: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """CL-RA CSRJ/RD-HJ: 结构分解和异构抖动组合"""
+    """CL-RA SJ: 结构分解和异构抖动组合（使用优化后的曲率计算）。"""
     if block.shape[0] < 10: return block, labels, ids
 
     cfg = config['controlled_structure_jittering']
-    curvatures = calculate_local_curvature(block, k_neighbors=cfg['k_neighbors'])
+    # 核心：调用高性能的曲率计算
+    curvatures = calculate_local_curvature(block, k_neighbors=cfg.get('k_neighbors', 15))
 
     N = block.shape[0]
-    R = np.linalg.norm(block[:, :3], axis=1)
 
-    # 1. 向量化计算 sigma_final
-    sigma_r_base = cfg['sigma_base'] * (1 + cfg['r_gradient_factor'] * R ** 2)
+    # 获取精简后的参数
+    sigma_flat = cfg.get('sigma_flat', 0.001)
+    edge_factor = cfg.get('edge_factor', 2.0)
+    curvature_threshold = cfg.get('curvature_threshold', 0.1)
+
+    # 1. 计算 sigma_final (不再依赖复杂的 r_gradient_factor)
+    sigma_base = sigma_flat
 
     curvature_factor = np.ones_like(curvatures)
-    high_curvature_mask = curvatures > cfg['curvature_threshold']
+    high_curvature_mask = curvatures > curvature_threshold
 
-    # 仅对高曲率点应用加权因子
-    curvature_factor[high_curvature_mask] = 1.0 + cfg['alpha_edge'] * (
-            curvatures[high_curvature_mask] - cfg['curvature_threshold']
+    # 对高曲率点应用边缘放大因子
+    curvature_factor[high_curvature_mask] = edge_factor * (
+            curvatures[high_curvature_mask] / curvature_threshold  # 比例缩放，增强边缘效果
     )
+    # 确保边缘因子不至于过大
+    curvature_factor = np.clip(curvature_factor, 1.0, edge_factor * 2)
 
-    sigma_final = sigma_r_base * curvature_factor
+    sigma_final = sigma_base * curvature_factor
 
-    # 2. 向量化生成噪声 (利用 NumPy 的广播功能)
-    sigma_xy = sigma_final
-    sigma_z = sigma_final * cfg['z_sensitivity_factor']
+    # 2. 生成噪声 (使用相同的 sigma 简化 Z 轴差异)
+    sigma_xyz = sigma_final  # 保持XYZ轴抖动一致
 
-    jitter_x = np.random.normal(loc=0., scale=sigma_xy).astype(np.float32)
-    jitter_y = np.random.normal(loc=0., scale=sigma_xy).astype(np.float32)
-    jitter_z = np.random.normal(loc=0., scale=sigma_z).astype(np.float32)
+    jitter_x = np.random.normal(loc=0., scale=sigma_xyz).astype(np.float32)
+    jitter_y = np.random.normal(loc=0., scale=sigma_xyz).astype(np.float32)
+    jitter_z = np.random.normal(loc=0., scale=sigma_xyz).astype(np.float32)
 
     jitter_xyz = np.stack((jitter_x, jitter_y, jitter_z), axis=1)
 

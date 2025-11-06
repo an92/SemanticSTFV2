@@ -34,9 +34,8 @@ src_dataset:
     - name: semantic_targeted_point_drop  # CL-RA: 核心点丢失
       prob: 1.0
       thing_class_ids: [ 0,1,2,3,4, 5,6,7,13,17,18 ]
-      max_drop_prob_stuff: 0.75
+      max_drop_prob_stuff: 0.4
       max_drop_prob_things: 0.005
-      depth_decay_factor: 0.03
 
     - name: add_random_noise_points
       prob: 1.0
@@ -46,12 +45,10 @@ src_dataset:
         
     - name: controlled_structure_jittering  # CL-RA: 核心结构抖动
       prob: 1.0
-      k_neighbors: 10
-      sigma_base: 0.002
-      r_gradient_factor: 0.0005
-      alpha_edge: 3.0
+      k_neighbors: 15
+      sigma_flat: 0.001
+      edge_factor: 2.0
       curvature_threshold: 0.1
-      z_sensitivity_factor: 1.5
 
 tgt_dataset:
   name: semantickitti
