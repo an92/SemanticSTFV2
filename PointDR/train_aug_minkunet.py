@@ -68,7 +68,8 @@ def main() -> None:
                                                       sampler=sampler,
                                                       num_workers=configs.workers_per_gpu,
                                                       pin_memory=True,
-                                                      collate_fn=dataset[split].collate_fn)
+                                                      collate_fn=dataset[split].collate_fn,
+                                                      )
 
     model = builder.make_model().cuda()
     if configs.distributed:

@@ -310,10 +310,6 @@ class SemanticKITTIInternal:
 
         _, inds, inverse_map = sparse_quantize(pc_, return_index=True, return_inverse=True)
 
-        if 'train' in self.split:
-            if len(inds) > self.num_points:
-                inds = np.random.choice(inds, self.num_points, replace=False)
-
         pc = pc_[inds]
         feat = block_[inds]
         labels = labels_[inds]

@@ -43,12 +43,12 @@ src_dataset:
       max_num: 2000
       intensity_scale: 0.5
         
-    - name: controlled_structure_jittering  # CL-RA: 核心结构抖动
-      prob: 1.0
-      k_neighbors: 15
-      sigma_flat: 0.001
-      edge_factor: 2.0
-      curvature_threshold: 0.1
+#    - name: controlled_structure_jittering  # CL-RA: 核心结构抖动
+#      prob: 1.0
+#      k_neighbors: 15
+#      sigma_flat: 0.001
+#      edge_factor: 2.0
+#      curvature_threshold: 0.1
 
 tgt_dataset:
   name: semantickitti

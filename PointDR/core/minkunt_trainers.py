@@ -17,10 +17,10 @@ from torchpack.utils.logging import logger
 from core.callbacks import MeanIoU
 import tqdm
 
-__all__ = ['RawMinkUnetTrainer']
+__all__ = ['MinkUnetTrainer']
 
 
-class RawMinkUnetTrainer(Trainer):
+class MinkUnetTrainer(Trainer):
 
     def __init__(self,
                  model: nn.Module,
@@ -58,7 +58,7 @@ class RawMinkUnetTrainer(Trainer):
             outputs = self.model(inputs)
 
             if outputs.requires_grad:
-                loss = self.criterion(outputs, targets)  # 仅计算标准的交叉熵损失
+                loss = self.criterion(outputs, targets)
 
         if outputs.requires_grad:
             self.summary.add_scalar('loss', loss.item())

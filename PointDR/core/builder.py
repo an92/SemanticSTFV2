@@ -92,8 +92,6 @@ def make_dataset() -> Dataset:
         tgt_dataset = get_kitti(phase='test')
     elif configs.tgt_dataset.name == 'semanticstf':
         tgt_dataset = get_stf()
-    elif configs.src_dataset.name == 'semanticRawkitti':
-        tgt_dataset = get_raw_kitti(phase='test')
     else:
         raise NotImplementedError(configs.dataset.name)
 
@@ -104,20 +102,20 @@ def make_dataset() -> Dataset:
 
 
 def make_model() -> nn.Module:
-    if configs.model.name == 'minkunet':
-        from core.models.semantic_kitti import MinkUNet_DR as MinkUNet
+    if configs.model.name == 'minkunet_dr':
+        from core.models.semantic_kitti import MinkUNet_DR
+        if 'cr' in configs.model:
+            cr = configs.model.cr
+        else:
+            cr = 1.0
+        model = MinkUNet_DR(num_classes=configs.data.num_classes, cr=cr)
+    elif configs.model.name == 'minkunet':
+        from core.models.semantic_kitti import MinkUNet
         if 'cr' in configs.model:
             cr = configs.model.cr
         else:
             cr = 1.0
         model = MinkUNet(num_classes=configs.data.num_classes, cr=cr)
-    elif configs.model.name == 'raw_minkunet':
-        from core.models.semantic_kitti import MinkUNet as RawMinkUNet
-        if 'cr' in configs.model:
-            cr = configs.model.cr
-        else:
-            cr = 1.0
-        model = RawMinkUNet(num_classes=configs.data.num_classes, cr=cr)
     else:
         raise NotImplementedError(configs.model.name)
     return model
