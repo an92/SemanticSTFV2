@@ -22,14 +22,7 @@ __all__ = ['MinkUnetTrainer']
 
 class MinkUnetTrainer(Trainer):
 
-    def __init__(self,
-                 model: nn.Module,
-                 criterion: Callable,
-                 optimizer: Optimizer,
-                 scheduler: Scheduler,
-                 num_workers: int,
-                 seed: int,
-                 amp_enabled: bool = False) -> None:
+    def __init__(self, model: nn.Module, criterion: Callable, optimizer: Optimizer, scheduler: Scheduler, num_workers: int, seed: int, amp_enabled: bool = False) -> None:
         self.model = model
         self.criterion = criterion
         self.optimizer = optimizer
@@ -46,16 +39,20 @@ class MinkUnetTrainer(Trainer):
         self.model.train()
         self.dataflow.sampler.set_epoch(self.epoch_num - 1)
 
-        self.dataflow.worker_init_fn = lambda worker_id: np.random.seed(
-            self.seed + (self.epoch_num - 1) * self.num_workers + worker_id)
+        self.dataflow.worker_init_fn = lambda worker_id: np.random.seed(self.seed + (self.epoch_num - 1) * self.num_workers + worker_id)
 
     def _run_step(self, feed_dict: Dict[str, Any]) -> Dict[str, Any]:
-        inputs = feed_dict['lidar'].cuda()
+        _inputs = {}
+        for key, value in feed_dict.items():
+            if 'name' not in key and 'ids' not in key:
+                _inputs[key] = value.cuda()
+
+        inputs = _inputs['lidar']
         targets = feed_dict['targets'].F.long().cuda(non_blocking=True)
 
         with amp.autocast(enabled=self.amp_enabled):
 
-            outputs = self.model(inputs)
+            outputs, _ = self.model(inputs)
 
             if outputs.requires_grad:
                 loss = self.criterion(outputs, targets)
@@ -68,7 +65,10 @@ class MinkUnetTrainer(Trainer):
             self.scaler.step(self.optimizer)
             self.scaler.update()
             self.scheduler.step()
-            return {'outputs': outputs, 'targets': targets}
+            return {
+                'outputs': outputs,
+                'targets': targets,
+            }
         else:
             invs = feed_dict['inverse_map']
             all_labels = feed_dict['targets_mapped']
@@ -85,7 +85,10 @@ class MinkUnetTrainer(Trainer):
             outputs = torch.cat(_outputs, 0)
             targets = torch.cat(_targets, 0)
 
-            return {'outputs': outputs, 'targets': targets}
+            return {
+                'outputs': outputs,
+                'targets': targets,
+            }
 
     def _after_epoch(self) -> None:
         self.model.eval()
@@ -107,11 +110,13 @@ class MinkUnetTrainer(Trainer):
     def _load_previous_checkpoint(self, checkpoint_path: str) -> None:
         pass
 
-    def train(self,
-              dataflow: DataLoader,
-              *,
-              num_epochs: int = 9999999,
-              callbacks: Optional[List[Callback]] = None) -> None:
+    def train(
+        self,
+        dataflow: DataLoader,
+        *,
+        num_epochs: int = 9999999,
+        callbacks: Optional[List[Callback]] = None,
+    ) -> None:
         self.dataflow = dataflow
         self.steps_per_epoch = len(self.dataflow)
         self.num_epochs = num_epochs
@@ -135,8 +140,7 @@ class MinkUnetTrainer(Trainer):
                 self.epoch_num += 1
                 self.local_step = 0
 
-                logger.info('Epoch {}/{} started.'.format(
-                    self.epoch_num, self.num_epochs))
+                logger.info('Epoch {}/{} started.'.format(self.epoch_num, self.num_epochs))
                 epoch_time = time.perf_counter()
                 self.before_epoch()
 
@@ -156,8 +160,7 @@ class MinkUnetTrainer(Trainer):
                 self.trigger_epoch()
                 logger.info('Epoch finished in {}.'.format(humanize.naturaldelta(time.perf_counter() - epoch_time)))
 
-            logger.success('{} epochs of training finished in {}.'.format(self.num_epochs, humanize.naturaldelta(
-                time.perf_counter() - train_time)))
+            logger.success('{} epochs of training finished in {}.'.format(self.num_epochs, humanize.naturaldelta(time.perf_counter() - train_time)))
         except StopTraining as e:
             logger.info('Training was stopped by {}.'.format(str(e)))
         finally:
