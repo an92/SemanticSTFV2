@@ -15,7 +15,7 @@ from torchpack.utils.logging import logger
 
 from core import builder
 from core.callbacks import MeanIoU
-from PointDR.core.minkunt_trainers import MinkUnetTrainer
+from PointDR.core.pointdr_trainers import SemanticSTFTrainer
 from PointDR.tools.util import auto_time_set_run_dir, BestEpochSaver, EpochSaver
 
 
@@ -23,10 +23,10 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         '--config',
-        default='/home/SemanticSTFV2/PointDR/configs/aug_minkunet.yaml',
+        default='/home/SemanticSTFV2/PointDR/configs/base_pointdr.yaml',
         help='config file',
     )
-    parser.add_argument('--run-dir', default='aug_minkunet', help='run directory')
+    parser.add_argument('--run-dir', default='pointdr', help='run directory')
     args, opts = parser.parse_known_args()
 
     configs.load(args.config, recursive=True)
@@ -58,14 +58,12 @@ def main() -> None:
     dataflow = {}
     for split in dataset:
         sampler = torch.utils.data.distributed.DistributedSampler(dataset[split], num_replicas=dist.size(), rank=dist.rank(), shuffle=(split == 'train'))
-        dataflow[split] = torch.utils.data.DataLoader(
-            dataset[split],
-            batch_size=configs.batch_size,
-            sampler=sampler,
-            num_workers=configs.workers_per_gpu,
-            pin_memory=True,
-            collate_fn=dataset[split].collate_fn,
-        )
+        dataflow[split] = torch.utils.data.DataLoader(dataset[split],
+                                                      batch_size=configs.batch_size,
+                                                      sampler=sampler,
+                                                      num_workers=configs.workers_per_gpu,
+                                                      pin_memory=True,
+                                                      collate_fn=dataset[split].collate_fn)
 
     model = builder.make_model().cuda()
     if configs.distributed:
@@ -75,15 +73,7 @@ def main() -> None:
     optimizer = builder.make_optimizer(model)
     scheduler = builder.make_scheduler(optimizer)
 
-    trainer = MinkUnetTrainer(
-        model=model,
-        criterion=criterion,
-        optimizer=optimizer,
-        scheduler=scheduler,
-        num_workers=configs.workers_per_gpu,
-        seed=seed,
-        amp_enabled=configs.amp_enabled,
-    )
+    trainer = SemanticSTFTrainer(model=model, criterion=criterion, optimizer=optimizer, scheduler=scheduler, num_workers=configs.workers_per_gpu, seed=seed, amp_enabled=configs.amp_enabled)
     trainer.train_with_defaults(
         dataflow['train'],
         num_epochs=configs.num_epochs,
@@ -91,8 +81,8 @@ def main() -> None:
             dataflow[split],
             callbacks=[MeanIoU(name=f'iou/{split}', num_classes=configs.data.num_classes, ignore_label=configs.data.ignore_label)],
         ) for split in ['test']] + [
-            BestEpochSaver('iou/test', filename='best_epoch'),
-            EpochSaver(max_to_keep=None),
+            BestEpochSaver('iou/test', filename='best_epoch.pt'),
+            EpochSaver(),
         ])
 
 

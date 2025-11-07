@@ -1,3 +1,7 @@
+model:
+  name: minkunet_dr
+  cr: 0.5
+
 data:
   num_classes: 19
   ignore_label: 255
@@ -8,18 +12,18 @@ train:
   deterministic: False
 
 src_dataset:
-  name: semantickitti
+  name: semantickitti   # pointdr原始的数据处理方式
   root: /home/dataset/SemanticKITTI/sequences
   num_points: 80000
   voxel_size: 0.05
 
 tgt_dataset:
-  name: semanticstf
-  root: /home/dataset/SemanticSTF
+  name: semantickitti    # kitti数据进行测试
+  root: /home/dataset/SemanticKITTI/sequences
   num_points: 80000
   voxel_size: 0.05
 
-num_epochs: 30
+num_epochs: 50
 batch_size: 8
 
 criterion:
@@ -35,3 +39,7 @@ optimizer:
 
 scheduler:
   name: cosine_warmup
+
+workers_per_gpu: 8
+distributed: False
+amp_enabled: True

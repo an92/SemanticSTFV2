@@ -9,9 +9,9 @@ from torchpack.utils.logging import logger
 
 __all__ = ['SingleAugSemanticKITTI']
 
-from PointDR.core.datasets.transform_3d import apply_rotate_scale, apply_semantic_targeted_point_drop, \
-    apply_controlled_structure_jittering, apply_random_jittering, apply_random_drop_out, apply_add_noise_points, \
-    apply_flip_axis
+from PointDR.core.datasets.transform_3d import apply_rotate_scale, \
+    apply_random_jittering, apply_random_drop_out, apply_add_noise_points, \
+    apply_flip_axis, apply_beamwise_semantic_drop, apply_beamwise_semantic_jitter
 
 label_name_mapping = {
     0: 'unlabeled',
@@ -58,8 +58,8 @@ kept_labels = [
 AUG_MAP = {
     'rotate_scale': apply_rotate_scale,
     'flip_axis': apply_flip_axis,
-    'semantic_targeted_point_drop': apply_semantic_targeted_point_drop,
-    'controlled_structure_jittering': apply_controlled_structure_jittering,
+    'beamwise_semantic_drop': apply_beamwise_semantic_drop,
+    'beamwise_semantic_jitter': apply_beamwise_semantic_jitter,
     'random_general_jittering': apply_random_jittering,
     'random_drop_out': apply_random_drop_out,
     'add_random_noise_points': apply_add_noise_points,
@@ -186,9 +186,6 @@ class SingleAugSemanticKITTIInternal:
         with open(self.files[index], 'rb') as b:
             block_ = np.fromfile(b, dtype=np.float32).reshape(-1, 4)
 
-        # **(与 __getitem__ 唯一的不同：添加 IDs 和增强调用)**
-        # 原始代码没有 ids，但在增强流水线中 ids 是必需的。
-        # 为了保持一致性，我们在读取后创建 ids，并在增强后丢弃它。
         ids = np.arange(block_.shape[0])
 
         label_file = self.files[index].replace('velodyne', 'labels').replace('.bin', '.label')
@@ -232,50 +229,8 @@ class SingleAugSemanticKITTIInternal:
             'file_name': self.files[index]
         }
 
-    def return_single_view(self, index):
-        with open(self.files[index], 'rb') as b:
-            block_ = np.fromfile(b, dtype=np.float32).reshape(-1, 4)
-        # read labels
-        pc_ = np.round(block_[:, :3] / self.voxel_size).astype(np.int32)
-        pc_ -= pc_.min(0, keepdims=1)
-
-        label_file = self.files[index].replace('velodyne', 'labels').replace('.bin', '.label')
-        if os.path.exists(label_file):
-            with open(label_file, 'rb') as a:
-                all_labels = np.fromfile(a, dtype=np.int32).reshape(-1)
-        else:
-            all_labels = np.zeros(pc_.shape[0]).astype(np.int32)
-
-        labels_ = self.label_map[all_labels & 0xFFFF].astype(np.int64)
-
-        _, inds, inverse_map = sparse_quantize(pc_, return_index=True, return_inverse=True)
-
-        if 'train' in self.split:
-            if len(inds) > self.num_points:
-                inds = np.random.choice(inds, self.num_points, replace=False)
-
-        pc = pc_[inds]
-        feat = block_[inds]
-        labels = labels_[inds]
-
-        lidar = SparseTensor(feat, pc)
-        labels = SparseTensor(labels, pc)
-        labels_ = SparseTensor(labels_, pc_)
-        inverse_map = SparseTensor(inverse_map, pc_)
-
-        return {
-            'lidar': lidar,
-            'targets': labels,
-            'targets_mapped': labels_,
-            'inverse_map': inverse_map,
-            'file_name': self.files[index],
-        }
-
     def __getitem__(self, index):
-        if self.split in ['val', 'test']:
-            return self.return_single_view(index)
-        else:
-            return self.return_aug_single_views(index)
+        return self.return_aug_single_views(index)
 
     @staticmethod
     def collate_fn(inputs):

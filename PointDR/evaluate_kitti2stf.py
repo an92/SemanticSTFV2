@@ -2,7 +2,7 @@ import os
 import argparse
 import numpy as np
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "7"
+os.environ["CUDA_VISIBLE_DEVICES"] = "5"
 
 import torch
 import torch.backends.cudnn
@@ -69,9 +69,9 @@ def main() -> None:
     torch.cuda.set_device(dist.local_rank())
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('--config', default="/home/SemanticSTFV2/PointDR/configs/rawkitti2stf/minkunet/cr0p5.yaml",
+    parser.add_argument('--config', default="/home/SemanticSTFV2/PointDR/configs/base_minkunet.yaml",
                         help='config file')
-    parser.add_argument('--checkpoint_path', default="/home/SemanticSTFV2/runs/run_62330647/checkpoints/max-iou-test.pt",
+    parser.add_argument('--checkpoint_path', default="/home/SemanticSTFV2/runs/minkunet_62419725/checkpoints/epoch-30.pt",
                         help='checkpoint_path')
     parser.add_argument('--name', type=str, default='minkunet', help='model name')
     parser.add_argument('--save_pred', type=str, default=None, help='save prediction dir, do not save if none')
@@ -122,7 +122,7 @@ def main() -> None:
         inputs = _inputs['lidar']
         targets = feed_dict['targets'].F.long().cuda(non_blocking=True)
         # outputs, _ = model(inputs)
-        outputs = model(inputs)
+        outputs, _ = model(inputs)
 
 
         invs = feed_dict['inverse_map']

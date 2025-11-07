@@ -1,6 +1,9 @@
 import argparse
+import os
 import random
 import sys
+
+os.environ["CUDA_VISIBLE_DEVICES"] = "7"
 
 from PointDR.core.minkunt_trainers import MinkUnetTrainer
 from PointDR.tools.util import auto_time_set_run_dir, BestEpochSaver, EpochSaver
@@ -67,23 +70,30 @@ def main() -> None:
                                                       collate_fn=dataset[split].collate_fn)
 
     model = builder.make_model().cuda()
-    if configs.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[dist.local_rank()], find_unused_parameters=True)
-
     criterion = builder.make_criterion()
     optimizer = builder.make_optimizer(model)
     scheduler = builder.make_scheduler(optimizer)
 
-    trainer = MinkUnetTrainer(model=model, criterion=criterion, optimizer=optimizer, scheduler=scheduler, num_workers=configs.workers_per_gpu, seed=seed, amp_enabled=configs.amp_enabled)
+    trainer = MinkUnetTrainer(
+        model=model,
+        criterion=criterion,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        num_workers=configs.workers_per_gpu,
+        seed=seed,
+        amp_enabled=configs.amp_enabled,
+    )
     trainer.train_with_defaults(
         dataflow['train'],
         num_epochs=configs.num_epochs,
         callbacks=[InferenceRunner(
             dataflow[split],
-            callbacks=[MeanIoU(name=f'iou/{split}', num_classes=configs.data.num_classes, ignore_label=configs.data.ignore_label)],
+            callbacks=[
+                MeanIoU(name=f'iou/{split}', num_classes=configs.data.num_classes, ignore_label=configs.data.ignore_label),
+            ],
         ) for split in ['test']] + [
-            BestEpochSaver('iou/test', filename='best_epoch.pt'),
-            EpochSaver(),
+            BestEpochSaver('iou/test', filename='best_epoch'),
+            EpochSaver(max_to_keep=None),
         ])
 
 

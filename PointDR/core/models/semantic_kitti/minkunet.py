@@ -200,4 +200,4 @@ class MinkUNet(nn.Module):
 
         out = self.classifier(y4.F)
 
-        return out
+        return out, None
