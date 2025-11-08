@@ -116,6 +116,13 @@ def make_model() -> nn.Module:
         else:
             cr = 1.0
         model = MinkUNet(num_classes=configs.data.num_classes, cr=cr)
+    elif configs.model.name == 'minkunet_robust':
+        from core.models.semantic_kitti import MinkUNet_Robust
+        if 'cr' in configs.model:
+            cr = configs.model.cr
+        else:
+            cr = 1.0
+        model = MinkUNet_Robust(num_classes=configs.data.num_classes, cr=cr)
     else:
         raise NotImplementedError(configs.model.name)
     return model

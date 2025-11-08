@@ -11,8 +11,7 @@ __all__ = ['SingleAugSemanticKITTI']
 
 from PointDR.core.datasets.transform_3d import apply_rotate_scale, \
     apply_random_jittering, apply_random_drop_out, apply_add_noise_points, \
-    apply_flip_axis, apply_beamwise_semantic_drop, apply_beamwise_semantic_jitter, \
-    apply_vulnerable_region_drop, apply_global_outlier_scaling, apply_range_dependent_jittering
+    apply_flip_axis,apply_intensity_channel_distortion, apply_physical_attenuation_model, apply_selective_range_jittering
 
 label_name_mapping = {
     0: 'unlabeled',
@@ -59,14 +58,12 @@ kept_labels = [
 AUG_MAP = {
     'rotate_scale': apply_rotate_scale,
     'flip_axis': apply_flip_axis,
-    'beamwise_semantic_drop': apply_beamwise_semantic_drop,
-    'beamwise_semantic_jitter': apply_beamwise_semantic_jitter,
     'random_general_jittering': apply_random_jittering,
     'random_drop_out': apply_random_drop_out,
     'add_random_noise_points': apply_add_noise_points,
-    'vulnerable_region_drop': apply_vulnerable_region_drop,
-    'global_outlier_scaling': apply_global_outlier_scaling,
-    'range_dependent_jittering': apply_range_dependent_jittering,
+    'intensity_channel_distortion': apply_intensity_channel_distortion,
+    'physical_attenuation_model': apply_physical_attenuation_model,
+    'selective_range_jittering': apply_selective_range_jittering,
 }
 
 

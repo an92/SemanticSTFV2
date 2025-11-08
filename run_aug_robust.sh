@@ -12,5 +12,5 @@ export CUDA_VISIBLE_DEVICES=7
 #nohup torchrun --nproc_per_node=2 --master_port=29999 PointDR/train_aug.py > aug_pointdr.log 2>&1 &
 
 
-nohup python PointDR/train_aug_robust.py > aug_robust.log 2>&1 &
+nohup python PointDR/train_aug_base_robust.py > aug_base_robust.log 2>&1 &
 

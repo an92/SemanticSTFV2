@@ -19,7 +19,8 @@ from core.callbacks import MeanIoU
 from torchsparse import SparseTensor
 import tqdm
 
-__all__ = ['RobustTrainer']
+__all__ = ['BaseRobustTrainer']
+
 
 
 class SpatialAwareAdversarialGenerator(nn.Module):
@@ -28,7 +29,6 @@ class SpatialAwareAdversarialGenerator(nn.Module):
     使用稀疏 3D 卷积在特征空间生成具有局部依赖性的扰动。
     """
 
-    # ... (SpatialAwareAdversarialGenerator 保持不变)
     def __init__(self, input_dim: int, output_dim: int, ks: int = 3):
         super().__init__()
         self.conv1 = nn.Sequential(
@@ -55,8 +55,7 @@ class SpatialAwareAdversarialGenerator(nn.Module):
 
         return SparseTensor(delta_F, out.C, out.s)
 
-
-class RobustTrainer(Trainer):
+class BaseRobustTrainer(Trainer):
 
     def __init__(self,
                  model: nn.Module,
@@ -68,10 +67,7 @@ class RobustTrainer(Trainer):
                  amp_enabled: bool = False,
                  adv_lambda: float = 0.05,  # 对抗损失 L_Adv_U 的权重
                  adv_epsilon: float = 0.1,
-                 adv_lr: float = 1e-4,
-                 things_class_ids: list =[],
-                 things_weights: float=5.0,
-                 stuff_weights:float= 1.0) -> None:
+                 adv_lr: float = 1e-4) -> None:
         self.model = model
         self.criterion = criterion
         self.optimizer = optimizer
@@ -86,9 +82,6 @@ class RobustTrainer(Trainer):
 
         self.lamda = 0.1  # 原有的对比损失 L_con 权重
         self.T = 0.07
-        self.things_class_ids = things_class_ids
-        self.thing_adv_weight=things_weights
-        self.stuff_adv_weight = stuff_weights
 
         self.adv_epsilon = adv_epsilon
         self.adv_lambda = adv_lambda
@@ -108,7 +101,7 @@ class RobustTrainer(Trainer):
     def _before_epoch(self) -> None:
         self.model.train()
         if self.adv_generator is not None:
-            self.adv_generator.train()
+            self.adv_generator.train()  # 确保 G_Adv 处于训练模式
 
         self.dataflow.sampler.set_epoch(self.epoch_num - 1)
 
@@ -131,62 +124,38 @@ class RobustTrainer(Trainer):
             outputs_1, feat_1, x_raw = self.model(inputs_1)
 
             if outputs_1.requires_grad:
-                # L_Seg (loss_1) 保持不变，如果需要 Focal Loss/逆频率加权，应在 self.criterion 中实现
                 loss_1 = self.criterion(outputs_1, targets_1)
 
         if outputs_1.requires_grad:
-            targets_cuda = targets_1
+            targets_cuda = targets_1  # 默认使用 clean view 标签作为对比学习目标
 
             x_raw_detached = SparseTensor(x_raw.F.detach(), x_raw.C, x_raw.s)
             x_raw_detached.F.requires_grad = True
 
-            # === 新增：创建 Thing Class 掩码 ===
-            thing_mask = torch.zeros_like(targets_cuda, dtype=torch.bool)
-            for thing_id in self.things_class_ids:
-                thing_mask |= (targets_cuda == thing_id)
+            with amp.autocast(enabled=self.amp_enabled):
+                # 1.1 优化 G_Adv (最大化不确定性 U)
+                delta_x = self.adv_generator(x_raw_detached)
 
-            # 至少需要一个 Thing Class 点才能启用加权扰动损失，否则使用干净特征作为 Query
-            if thing_mask.sum() > 0:
-                with amp.autocast(enabled=self.amp_enabled):
-                    # 1.1 优化 G_Adv (最大化不确定性 U)
-                    delta_x = self.adv_generator(x_raw_detached)  # G_Adv 在所有点上生成扰动
+                # L_inf 约束和应用扰动 (在特征张量 F 上进行)
+                delta_F_clamped = torch.clamp(delta_x.F, -self.adv_epsilon, self.adv_epsilon)
+                feat_hard_raw_tensor = x_raw.F + delta_F_clamped
 
-                    # L_inf 约束和应用扰动 (在特征张量 F 上进行)
-                    delta_F_clamped = torch.clamp(delta_x.F, -self.adv_epsilon, self.adv_epsilon)
+                # 计算不确定性 U (预测熵)
+                outputs_hard_logits = self.model.predict_head(feat_hard_raw_tensor.float())
+                outputs_hard_logsoftmax = nn.functional.log_softmax(outputs_hard_logits, dim=1)
+                U = -torch.sum(torch.exp(outputs_hard_logsoftmax) * outputs_hard_logsoftmax, dim=1).mean()
 
-                    # 构建硬样本特征 F_hard: 干净特征 + 局部扰动
-                    feat_hard_raw_F = x_raw.F.clone()
-                    # 将扰动添加到所有点上，即全局扰动
-                    feat_hard_raw_F += delta_F_clamped
+                # L_Adv_U 损失：最大化 U -> 损失是 -U
+                loss_AdvU_generator = -U
 
-                    # 1.2 计算不确定性 U (预测熵)
-                    outputs_hard_logits = self.model.predict_head(feat_hard_raw_F.float())
-                    outputs_hard_logsoftmax = nn.functional.log_softmax(outputs_hard_logits, dim=1)
-                    U_hard = -torch.sum(torch.exp(outputs_hard_logsoftmax) * outputs_hard_logsoftmax, dim=1)  # 逐点熵
+                # G_Adv 优化步骤
+            self.adv_generator_optimizer.zero_grad()
+            self.adv_scaler.scale(loss_AdvU_generator).backward(retain_graph=True)
+            self.adv_scaler.step(self.adv_generator_optimizer)
+            self.adv_scaler.update()
 
-                    # 1.3 === 核心修改：加权 G_Adv 损失 ===
-                    W_Adv = torch.ones_like(U_hard) * self.stuff_adv_weight
-                    W_Adv[thing_mask] = self.thing_adv_weight  # Thing Classes 权重更高
-
-                    # L_Adv_U 损失：最大化加权后的 U -> 损失是 -(W_Adv * U_hard).mean()
-                    loss_AdvU_generator = -(W_Adv * U_hard).mean()
-
-                    # G_Adv 优化步骤
-                self.adv_generator_optimizer.zero_grad()
-                self.adv_scaler.scale(loss_AdvU_generator).backward(retain_graph=True)
-                self.adv_scaler.step(self.adv_generator_optimizer)
-                self.adv_scaler.update()
-
-                # 2. 最终 Query 特征：使用硬样本的投影特征 F_hard
-                feat_2_query = self.model.proj(feat_hard_raw_F.detach().float())
-
-            else:
-                # Batch 中没有 Thing Class，跳过 G_Adv 优化
-                logger.debug("Skipping G_Adv step: No Thing Classes found.")
-                loss_AdvU_generator = torch.zeros(1, device='cuda', dtype=torch.float32)
-
-                # 2. 最终 Query 特征：使用干净样本的投影特征 (无扰动)
-                feat_2_query = self.model.proj(x_raw.F.detach().float())
+            # 2. 最终 Query 特征：使用硬样本的投影特征 F_hard
+            feat_2_query = self.model.proj(feat_hard_raw_tensor.detach().float())
 
             # 3. 对比损失 (L_con) 计算 (与之前逻辑相同)
             feat_1_norm = nn.functional.normalize(feat_1.detach(), dim=1)
@@ -201,7 +170,6 @@ class RobustTrainer(Trainer):
 
             logits = torch.mm(feat_2_norm, self.model.memo_bank.T.detach())
             logits /= self.T
-            # L_CL (loss_2) 保持不变
             loss_2 = self.criterion(logits, targets_cuda)
 
             self.model.momentum_update_key_encoder(feat1_proto.detach(), init=(self.global_step == 1))
@@ -344,7 +312,7 @@ def evaluate(val_loader, model):
                 if not 'name' in key:
                     _inputs[key] = value.cuda()
             inputs = _inputs['lidar']
-            outputs, _, _ = model(inputs)
+            outputs, _ , _= model(inputs)
 
             invs = feed_dict['inverse_map']
             all_labels = feed_dict['targets_mapped']

@@ -1,8 +1,9 @@
 import argparse
+import os
 import random
 import sys
 
-from PointDR.core.robust_trainers import RobustTrainer
+# os.environ["CUDA_VISIBLE_DEVICES"] = "7"
 
 import numpy as np
 import torch
@@ -15,6 +16,7 @@ from torchpack.callbacks import InferenceRunner
 from torchpack.utils.config import configs
 from torchpack.utils.logging import logger
 
+from PointDR.core.base_robust_trainers import BaseRobustTrainer
 from core import builder
 from core.callbacks import MeanIoU
 from PointDR.tools.util import auto_time_set_run_dir, BestEpochSaver, EpochSaver
@@ -24,10 +26,10 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         '--config',
-        default='/home/SemanticSTFV2/PointDR/configs/aug_robust.yaml',
+        default='/home/SemanticSTFV2/PointDR/configs/aug_base_robust.yaml',
         help='config file',
     )
-    parser.add_argument('--run-dir', default='aug_robust', help='run directory')
+    parser.add_argument('--run-dir', default='aug_base_robust', help='run directory')
     args, opts = parser.parse_known_args()
 
     configs.load(args.config, recursive=True)
@@ -67,11 +69,14 @@ def main() -> None:
                                                       collate_fn=dataset[split].collate_fn)
 
     model = builder.make_model().cuda()
+    if configs.distributed:
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[dist.local_rank()], find_unused_parameters=True)
+
     criterion = builder.make_criterion()
     optimizer = builder.make_optimizer(model)
     scheduler = builder.make_scheduler(optimizer)
 
-    trainer = RobustTrainer(
+    trainer = BaseRobustTrainer(
         model=model,
         criterion=criterion,
         optimizer=optimizer,
@@ -79,22 +84,16 @@ def main() -> None:
         num_workers=configs.workers_per_gpu,
         seed=seed,
         amp_enabled=configs.amp_enabled,
-        things_class_ids=configs.model.things_class_ids,
         adv_lambda=configs.model.adv_lambda,
         adv_epsilon=configs.model.adv_epsilon,
         adv_lr=0.0001,
-        things_weights=configs.model.things_weights,
-        stuff_weights=configs.model.stuff_weights,
-
-    )
+        )
     trainer.train_with_defaults(
         dataflow['train'],
         num_epochs=configs.num_epochs,
         callbacks=[InferenceRunner(
             dataflow[split],
-            callbacks=[
-                MeanIoU(name=f'iou/{split}', num_classes=configs.data.num_classes, ignore_label=configs.data.ignore_label),
-            ],
+            callbacks=[MeanIoU(name=f'iou/{split}', num_classes=configs.data.num_classes, ignore_label=configs.data.ignore_label)],
         ) for split in ['test']] + [
             BestEpochSaver('iou/test', filename='best_epoch'),
             EpochSaver(max_to_keep=None),

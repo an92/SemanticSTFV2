@@ -4,13 +4,13 @@ data:
   training_size: 19132
 
 model:
-  name: minkunet_dr
+  name: minkunet_robust
   cr: 0.5
-  lamda_CL: 0.25   # # PointDR 对比损失权重
-  lamda_SCRL: 0.1  # SCRL 损失权重
-  lamda_FeatConsist: 0.3  # LDR-FR 损失权重
-  repulsion_margin: 1.0  # SCRL 推远损失的 margin (L2距离)
-  thing_class_ids: [ 0, 1, 2, 3, 4, 5, 6, 7, 13, 17, 18 ]
+  adv_lambda: 0.05
+  adv_epsilon: 0.4
+  things_class_ids: [ 0, 1, 2, 3, 4, 5, 6, 7, 13, 17, 18 ]
+  things_weights: 5.0
+  stuff_weights: 1.0
 
 train:
   seed: 1588147245

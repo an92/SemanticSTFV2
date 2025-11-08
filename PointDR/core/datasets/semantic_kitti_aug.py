@@ -9,9 +9,10 @@ from torchpack.utils.logging import logger
 
 __all__ = ['AugSemanticKITTI']
 
-from PointDR.core.datasets.transform_3d import apply_rotate_scale, apply_beamwise_semantic_drop, \
-    apply_random_jittering, apply_random_drop_out, apply_add_noise_points, apply_beamwise_semantic_jitter, \
-    apply_flip_axis
+from PointDR.core.datasets.transform_3d import apply_rotate_scale, \
+    apply_random_jittering, apply_random_drop_out, apply_add_noise_points, \
+    apply_flip_axis, apply_intensity_channel_distortion, apply_selective_range_jittering, \
+    apply_physical_attenuation_model
 
 label_name_mapping = {
     0: 'unlabeled',
@@ -58,13 +59,13 @@ kept_labels = [
 AUG_MAP = {
     'rotate_scale': apply_rotate_scale,
     'flip_axis': apply_flip_axis,
-    'beamwise_semantic_drop': apply_beamwise_semantic_drop,
-    'beamwise_semantic_jitter': apply_beamwise_semantic_jitter,
     'random_general_jittering': apply_random_jittering,
     'random_drop_out': apply_random_drop_out,
     'add_random_noise_points': apply_add_noise_points,
+    'intensity_channel_distortion': apply_intensity_channel_distortion,
+    'physical_attenuation_model': apply_physical_attenuation_model,
+    'selective_range_jittering': apply_selective_range_jittering,
 }
-
 
 class AugmentationPipeline:
 
