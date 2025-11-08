@@ -2,7 +2,7 @@ import os
 import argparse
 import numpy as np
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "5"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 import torch
 import torch.backends.cudnn
@@ -69,9 +69,9 @@ def main() -> None:
     torch.cuda.set_device(dist.local_rank())
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('--config', default="/home/SemanticSTFV2/PointDR/configs/base_minkunet.yaml",
+    parser.add_argument('--config', default="/home/SemanticSTFV2/PointDR/configs/aug_minkunet.yaml",
                         help='config file')
-    parser.add_argument('--checkpoint_path', default="/home/SemanticSTFV2/runs/minkunet_62419725/checkpoints/epoch-30.pt",
+    parser.add_argument('--checkpoint_path', default="/home/SemanticSTFV2/runs/aug_minkunet_62502991/checkpoints/best_epoch.pt",
                         help='checkpoint_path')
     parser.add_argument('--name', type=str, default='minkunet', help='model name')
     parser.add_argument('--save_pred', type=str, default=None, help='save prediction dir, do not save if none')
@@ -154,8 +154,10 @@ def main() -> None:
 
     print("===" * 10)
     print(dataset)
-    print("iou per class: ", ious)
-    print("miou:", miou)
+    print("iou per class: ")
+    formatted_ious = [f"{i * 100:.1f}" for i in ious]
+    print(formatted_ious)
+    print("miou: %.1f" % (miou * 100))
     print("===" * 10)
 
 if __name__ == '__main__':

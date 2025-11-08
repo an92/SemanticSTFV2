@@ -82,7 +82,7 @@ def main() -> None:
             callbacks=[MeanIoU(name=f'iou/{split}', num_classes=configs.data.num_classes, ignore_label=configs.data.ignore_label)],
         ) for split in ['test']] + [
             BestEpochSaver('iou/test', filename='best_epoch'),
-            EpochSaver(),
+            EpochSaver(max_to_keep=None),
         ])
 
 

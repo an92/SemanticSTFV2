@@ -11,7 +11,8 @@ __all__ = ['SingleAugSemanticKITTI']
 
 from PointDR.core.datasets.transform_3d import apply_rotate_scale, \
     apply_random_jittering, apply_random_drop_out, apply_add_noise_points, \
-    apply_flip_axis, apply_beamwise_semantic_drop, apply_beamwise_semantic_jitter
+    apply_flip_axis, apply_beamwise_semantic_drop, apply_beamwise_semantic_jitter, \
+    apply_vulnerable_region_drop, apply_global_outlier_scaling, apply_range_dependent_jittering
 
 label_name_mapping = {
     0: 'unlabeled',
@@ -63,6 +64,9 @@ AUG_MAP = {
     'random_general_jittering': apply_random_jittering,
     'random_drop_out': apply_random_drop_out,
     'add_random_noise_points': apply_add_noise_points,
+    'vulnerable_region_drop': apply_vulnerable_region_drop,
+    'global_outlier_scaling': apply_global_outlier_scaling,
+    'range_dependent_jittering': apply_range_dependent_jittering,
 }
 
 
@@ -197,12 +201,7 @@ class SingleAugSemanticKITTIInternal:
 
         labels_ = self.label_map[all_labels & 0xFFFF].astype(np.int64)
 
-        block_, labels_, ids = self.pipeline.run_pipeline(
-            block_.copy(),
-            labels_.copy(),
-            ids.copy(),
-            self.pipeline.strong_steps
-        )
+        block_, labels_, ids = self.pipeline.run_pipeline(block_.copy(), labels_.copy(), ids.copy(), self.pipeline.strong_steps)
 
         pc_ = np.round(block_[:, :3] / self.voxel_size).astype(np.int32)
         pc_ -= pc_.min(0, keepdims=True)
@@ -221,13 +220,7 @@ class SingleAugSemanticKITTIInternal:
         labels_ = SparseTensor(labels_, pc_)
         inverse_map = SparseTensor(inverse_map, pc_)
 
-        return {
-            'lidar': lidar,
-            'targets': labels,
-            'targets_mapped': labels_,
-            'inverse_map': inverse_map,
-            'file_name': self.files[index]
-        }
+        return {'lidar': lidar, 'targets': labels, 'targets_mapped': labels_, 'inverse_map': inverse_map, 'file_name': self.files[index]}
 
     def __getitem__(self, index):
         return self.return_aug_single_views(index)

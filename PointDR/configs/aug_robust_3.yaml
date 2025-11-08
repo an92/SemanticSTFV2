@@ -4,20 +4,36 @@ data:
   training_size: 19132
 
 model:
-  name: minkunet
+  name: minkunet_dr
   cr: 0.5
+  lamda_CL: 0.15   # # PointDR 对比损失权重
+  lamda_SCRL: 0.15  # SCRL 损失权重
+  lamda_FeatConsist: 0.45  # LDR-FR 损失权重
+  repulsion_margin: 1.0  # SCRL 推远损失的 margin (L2距离)
+  thing_class_ids: [ 0, 1, 2, 3, 4, 5, 6, 7, 13, 17, 18 ]
+
 
 train:
   seed: 1588147245
   deterministic: False
 
 src_dataset:
-  name: semanticAugSinglekitti
+  name: semanticAugkitti
   root: /home/dataset/SemanticKITTI/sequences
   num_points: 80000
   voxel_size: 0.05
 
-  # --- 定义 Aug 流程---
+  # --- Weak Aug 流程 ---
+  weak_aug:
+    - name: rotate_scale         # 旋转和缩放
+      prob: 1.0
+      min_angle: 0.0
+      max_angle: 6.283185 # 2 * pi
+      min_scale: 0.95
+      max_scale: 1.05
+
+
+  # --- 定义 Strong Aug 流程---
   strong_aug:
     - name: rotate_scale
       prob: 1.0
@@ -49,20 +65,20 @@ src_dataset:
       remote_boost_factor: 1.5 # 远程（例如 > 40m）丢点权重增加 1.5倍
       thing_class_ids: [ 0, 1, 2, 3, 4, 5, 6, 7, 13, 17, 18 ]
 
-        
-tgt_dataset:
-  name: semantickitti
-  root: /home/dataset/SemanticKITTI/sequences
-  num_points: 80000
-  voxel_size: 0.05
 
 #tgt_dataset:
-#  name: semanticstf
-#  root: /home/dataset/SemanticSTF
+#  name: semantickitti
+#  root: /home/dataset/SemanticKITTI/sequences
 #  num_points: 80000
 #  voxel_size: 0.05
 
-num_epochs: 30
+tgt_dataset:
+  name: semanticstf
+  root: /home/dataset/SemanticSTF
+  num_points: 80000
+  voxel_size: 0.05
+
+num_epochs: 50
 batch_size: 8
 
 criterion:

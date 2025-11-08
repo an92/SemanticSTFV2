@@ -6,9 +6,9 @@ data:
 model:
   name: minkunet_dr
   cr: 0.5
-  lamda_CL: 0.1   # # PointDR 对比损失权重
-  lamda_SCRL: 0.05  # SCRL 损失权重
-  lamda_FeatConsist: 0.08  # LDR-FR 损失权重
+  lamda_CL: 0.25   # # PointDR 对比损失权重
+  lamda_SCRL: 0.1  # SCRL 损失权重
+  lamda_FeatConsist: 0.3  # LDR-FR 损失权重
   repulsion_margin: 1.0  # SCRL 推远损失的 margin (L2距离)
   thing_class_ids: [ 0, 1, 2, 3, 4, 5, 6, 7, 13, 17, 18 ]
 
@@ -46,32 +46,34 @@ src_dataset:
       prob_x: 0.5
       prob_y: 0.5
 
-    - name: beamwise_semantic_jitter
+    - name: range_dependent_jittering # 模拟折射，强度随距离增加
       prob: 0.5
-      angle_range: [0., 360.]
-      sector_size: [30., 60.]
-      stuff_jitter_std: [0.02, 0.02, 0.02] # 2cm
-      things_jitter_std: [0.10, 0.10, 0.10] # 10cm
+      base_std: 0.01   # 近距离基础抖动 1cm
+      dist_factor: 0.0005 # 每米增加 0.05cm 的 std
+
+    - name: global_outlier_scaling # 模拟全局噪声，强度更高
+      prob: 0.5
+      min_ratio: 0.05 # 至少 5% 噪声
+      max_ratio: 0.30 # 最高 30% 噪声（N_g / N_total = 0.30）
+      intensity_scale: 1.0
+
+    - name: vulnerable_region_drop # 启发式对抗性丢点
+      prob: 0.5
+      base_drop_ratio: 0.10 # 基础丢点比例
+      thing_boost_factor: 2.0 # Things 区域丢点权重加倍
+      remote_boost_factor: 1.5 # 远程（例如 > 40m）丢点权重增加 1.5倍
       thing_class_ids: [ 0, 1, 2, 3, 4, 5, 6, 7, 13, 17, 18 ]
 
-    - name: beamwise_semantic_drop
-      prob: 0.5
-      thing_drop_ratio: 0.35
-      stuff_drop_ratio: 0.08
-      angle_range: [ 0., 360. ]
-      sector_size: [ 45., 90. ]
-      thing_class_ids: [ 0, 1, 2, 3, 4, 5, 6, 7, 13, 17, 18 ]
 
-    - name: add_random_noise_points
-      prob: 1.0
-      min_num: 0
-      max_num: 2000
-      intensity_scale: 0.5
-
+#tgt_dataset:
+#  name: semantickitti
+#  root: /home/dataset/SemanticKITTI/sequences
+#  num_points: 80000
+#  voxel_size: 0.05
 
 tgt_dataset:
-  name: semantickitti
-  root: /home/dataset/SemanticKITTI/sequences
+  name: semanticstf
+  root: /home/dataset/SemanticSTF
   num_points: 80000
   voxel_size: 0.05
 

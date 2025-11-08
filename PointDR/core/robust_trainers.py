@@ -175,14 +175,14 @@ class RobustTrainer(Trainer):
                 else:
                     loss_FeatConsist = torch.zeros(1, device='cuda', dtype=feat_2.dtype)
 
+                # 损失总和
                 loss = loss_1 + self.lamda_CL * loss_CL + loss_SCRL + self.lamda_FeatConsist * loss_FeatConsist
 
                 self.summary.add_scalar('loss', loss.item())
-                self.summary.add_scalar('loss_1_sup', loss_1.item())
+                self.summary.add_scalar('loss_1', loss_1.item())
                 self.summary.add_scalar('loss_CL', loss_CL.item())
-                self.summary.add_scalar('loss_SCRL_consist', loss_consistency.item())
-                self.summary.add_scalar('loss_SCRL_rep', loss_repulsion.item())
-                self.summary.add_scalar('loss_FeatConsist', loss_FeatConsist.item())  # 记录新损失
+                self.summary.add_scalar('loss_SCRL', loss_SCRL.item())
+                self.summary.add_scalar('loss_FeatConsist', loss_FeatConsist.item())
 
                 self.optimizer.zero_grad()
                 self.scaler.scale(loss).backward()
