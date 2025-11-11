@@ -5,8 +5,8 @@ import sys
 import matplotlib.pyplot as plt
 import numpy as np
 
-LOG_FILE_NAME = '/home/SemanticSTFV2/runs/aug_base_robust_62573289/summary/scalars.jsonl'
-OUTPUT_IMAGE_NAME = '/home/SemanticSTFV2/runs/aug_base_robust_62573289/loss_curve.png'
+LOG_FILE_NAME = '/home/SemanticSTFV2/runs/aug_pointdr_62569107/summary/scalars.jsonl'
+OUTPUT_IMAGE_NAME = '/home/SemanticSTFV2/runs/aug_pointdr_62569107/loss_curve.png'
 
 
 def plot_and_save_all_loss_curve():

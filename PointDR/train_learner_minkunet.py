@@ -1,8 +1,14 @@
 import argparse
+import os
 import random
 import sys
 
-from PointDR.core.robust_trainers import RobustTrainer
+
+# os.environ["CUDA_VISIBLE_DEVICES"] = "7"
+
+from PointDR.tools.util import auto_time_set_run_dir, BestEpochSaver, EpochSaver
+from PointDR.core.learner_trainers import MinkUnetLearnerTrainer
+
 
 import numpy as np
 import torch
@@ -17,17 +23,16 @@ from torchpack.utils.logging import logger
 
 from core import builder
 from core.callbacks import MeanIoU
-from PointDR.tools.util import auto_time_set_run_dir, BestEpochSaver, EpochSaver
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         '--config',
-        default='/home/SemanticSTFV2/PointDR/configs/aug_robust.yaml',
+        default='/home/SemanticSTFV2/PointDR/configs/learner_minkunet.yaml',
         help='config file',
     )
-    parser.add_argument('--run-dir', default='aug_robust', help='run directory')
+    parser.add_argument('--run-dir', default='minkunet_learner', help='run directory')
     args, opts = parser.parse_known_args()
 
     configs.load(args.config, recursive=True)
@@ -47,7 +52,7 @@ def main() -> None:
 
     # seed
     if ('seed' not in configs.train) or (configs.train.seed is None):
-        configs.train.seed = torch.initial_seed() % (2**32 - 1)
+        configs.train.seed = torch.initial_seed() % (2 ** 32 - 1)
 
     seed = configs.train.seed + dist.rank() * configs.workers_per_gpu * configs.num_epochs
     random.seed(seed)
@@ -58,7 +63,8 @@ def main() -> None:
     dataset = builder.make_dataset()
     dataflow = {}
     for split in dataset:
-        sampler = torch.utils.data.distributed.DistributedSampler(dataset[split], num_replicas=dist.size(), rank=dist.rank(), shuffle=(split == 'train'))
+        sampler = torch.utils.data.distributed.DistributedSampler(dataset[split], num_replicas=dist.size(),
+                                                                  rank=dist.rank(), shuffle=(split == 'train'))
         dataflow[split] = torch.utils.data.DataLoader(dataset[split],
                                                       batch_size=configs.batch_size,
                                                       sampler=sampler,
@@ -68,36 +74,53 @@ def main() -> None:
 
     model = builder.make_model().cuda()
     criterion = builder.make_criterion()
-    optimizer = builder.make_optimizer(model)
-    scheduler = builder.make_scheduler(optimizer)
 
-    trainer = RobustTrainer(
+
+    # 1. 筛选主干网络参数
+    seg_params = [
+        p for name, p in model.named_parameters()
+        if 'ljm' not in name and 'adm' not in name and p.requires_grad
+    ]
+    # 2. 构建主优化器 (分割网络)
+    optimizer = builder.make_parms_optimizer(params=seg_params, config=configs.optimizer)
+    scheduler = builder.make_scheduler(optimizer)  # Scheduler 绑定主优化器
+
+    optimizer_ljm = None
+    if hasattr(configs, 'optimizer_ljm') and hasattr(model, 'ljm'):
+        optimizer_ljm = builder.make_parms_optimizer(params=model.ljm.parameters(), config=configs.optimizer_ljm)
+        logger.info('LJM Optimizer built successfully.')
+
+    optimizer_adm = None
+    if hasattr(configs, 'optimizer_adm') and hasattr(model, 'adm'):
+        optimizer_adm = builder.make_parms_optimizer(params=model.adm.parameters(), config=configs.optimizer_adm)
+        logger.info('ADM Optimizer built successfully.')
+
+    trainer = MinkUnetLearnerTrainer(
         model=model,
         criterion=criterion,
-        optimizer=optimizer,
+        optimizer=optimizer,  # 主优化器
         scheduler=scheduler,
         num_workers=configs.workers_per_gpu,
         seed=seed,
         amp_enabled=configs.amp_enabled,
-        things_class_ids=configs.model.things_class_ids,
-        things_weights=configs.model.things_weights,
-        stuff_weights=configs.model.stuff_weights,
-        lambda_cl=configs.model.lambda_cl,
-        lambda_gsp=configs.model.lambda_gsp,
-
+        # 传入 LJM 和 ADM 优化器
+        optimizer_ljm=optimizer_ljm,
+        optimizer_adm=optimizer_adm,
     )
+
     trainer.train_with_defaults(
         dataflow['train'],
         num_epochs=configs.num_epochs,
         callbacks=[InferenceRunner(
             dataflow[split],
             callbacks=[
-                MeanIoU(name=f'iou/{split}', num_classes=configs.data.num_classes, ignore_label=configs.data.ignore_label),
+                MeanIoU(name=f'iou/{split}', num_classes=configs.data.num_classes,
+                        ignore_label=configs.data.ignore_label),
             ],
         ) for split in ['test']] + [
-            BestEpochSaver('iou/test', filename='best_epoch'),
-            EpochSaver(max_to_keep=None),
-        ])
+                      BestEpochSaver('iou/test', filename='best_epoch'),
+                      EpochSaver(max_to_keep=None),
+                  ])
 
 
 if __name__ == '__main__':

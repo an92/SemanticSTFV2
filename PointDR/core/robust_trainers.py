@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import torch
 from torch import nn
@@ -8,52 +9,18 @@ from torchpack.utils.typing import Optimizer, Scheduler
 import time
 from typing import Any, Dict, List, Optional, Callable
 from torch.utils.data import DataLoader
-import torchsparse.nn as spnn
 from torchpack.callbacks import (Callback, Callbacks)
 from torchpack.train.exception import StopTraining
 from torchpack.train.summary import Summary
 from torchpack.utils import humanize
 from torchpack.utils.logging import logger
+# 假设 configs 模块已正确导入
 from torchpack.utils.config import configs
+# 假设 core.callbacks.MeanIoU 已在项目中定义
 from core.callbacks import MeanIoU
-from torchsparse import SparseTensor
 import tqdm
 
 __all__ = ['RobustTrainer']
-
-
-class SpatialAwareAdversarialGenerator(nn.Module):
-    """
-    空间感知型对抗性生成器 (G_Adv)。
-    使用稀疏 3D 卷积在特征空间生成具有局部依赖性的扰动。
-    """
-
-    # ... (SpatialAwareAdversarialGenerator 保持不变)
-    def __init__(self, input_dim: int, output_dim: int, ks: int = 3):
-        super().__init__()
-        self.conv1 = nn.Sequential(
-            spnn.Conv3d(input_dim, input_dim * 2, kernel_size=ks, stride=1),
-            spnn.BatchNorm(input_dim * 2),
-            spnn.ReLU(True)
-        )
-        self.conv2 = nn.Sequential(
-            spnn.Conv3d(input_dim * 2, output_dim, kernel_size=ks, stride=1),
-
-        )
-        # Tanh 激活函数 (用于约束扰动范围)
-        self.tanh = nn.Tanh()
-
-    def forward(self, x: SparseTensor) -> SparseTensor:
-        """
-        x: 稀疏张量 (SparseTensor)，包含特征 F_raw 和坐标 C。
-        返回: 稀疏张量 (SparseTensor)，包含扰动 delta_F。
-        """
-        out = self.conv1(x)
-        out = self.conv2(out)
-
-        delta_F = self.tanh(out.F)
-
-        return SparseTensor(delta_F, out.C, out.s)
 
 
 class RobustTrainer(Trainer):
@@ -66,12 +33,12 @@ class RobustTrainer(Trainer):
                  num_workers: int,
                  seed: int,
                  amp_enabled: bool = False,
-                 adv_lambda: float = 0.05,  # 对抗损失 L_Adv_U 的权重
-                 adv_epsilon: float = 0.1,
-                 adv_lr: float = 1e-4,
-                 things_class_ids: list =[],
-                 things_weights: float=5.0,
-                 stuff_weights:float= 1.0) -> None:
+                 things_class_ids: list = [],
+                 things_weights: float = 5.0,  # L_Focus 权重 (RCDW)
+                 stuff_weights: float = 1.0,  # L_Focus 权重
+                 lambda_cl: float = 0.1,  # L_CL 权重 (原 self.lamda)
+                 lambda_gsp: float = 0.05  # L_GSP 权重
+                 ) -> None:
         self.model = model
         self.criterion = criterion
         self.optimizer = optimizer
@@ -84,33 +51,20 @@ class RobustTrainer(Trainer):
 
         self.eval_interval = 500
 
-        self.lamda = 0.1  # 原有的对比损失 L_con 权重
-        self.T = 0.07
+        # GAFA-Lite 核心权重
+        self.lamda = lambda_cl  # L_CL 权重
+        self.T = 0.07  # 对比学习温度
+
         self.things_class_ids = things_class_ids
-        self.thing_adv_weight=things_weights
+        self.thing_adv_weight = things_weights
         self.stuff_adv_weight = stuff_weights
-
-        self.adv_epsilon = adv_epsilon
-        self.adv_lambda = adv_lambda
-
-        self.adv_generator = SpatialAwareAdversarialGenerator(
-            input_dim=48,
-            output_dim=48
-        ).cuda()
-
-        # 实例化 G_Adv 优化器和 Scaler
-        self.adv_generator_optimizer = torch.optim.Adam(
-            self.adv_generator.parameters(),
-            lr=adv_lr
-        )
-        self.adv_scaler = amp.GradScaler(enabled=self.amp_enabled)
+        self.lambda_gsp = lambda_gsp
 
     def _before_epoch(self) -> None:
         self.model.train()
-        if self.adv_generator is not None:
-            self.adv_generator.train()
-
-        self.dataflow.sampler.set_epoch(self.epoch_num - 1)
+        # 确保 dataflow 和 dataflow.sampler 存在
+        if hasattr(self, 'dataflow') and hasattr(self.dataflow, 'sampler'):
+            self.dataflow.sampler.set_epoch(self.epoch_num - 1)
 
         self.dataflow.worker_init_fn = lambda worker_id: np.random.seed(
             self.seed + (self.epoch_num - 1) * self.num_workers + worker_id)
@@ -121,125 +75,120 @@ class RobustTrainer(Trainer):
             if 'name' not in key and 'ids' not in key:
                 _inputs[key] = value.cuda()
 
-        inputs_1 = _inputs['lidar']
+        inputs_1 = _inputs['lidar']  # 弱视图 x^W
         targets_1 = feed_dict['targets'].F.long().cuda(non_blocking=True)
 
-        loss_AdvU_generator = torch.zeros(1, device='cuda', dtype=torch.float32)
+        # 强视图输入和标签
+        inputs_2 = _inputs['lidar_2']
+        targets_2 = feed_dict['targets_2'].F.long().cuda(non_blocking=True)
+
+        targets_cuda = targets_1  # 主要使用 targets_1 作为监督和对比目标
 
         with amp.autocast(enabled=self.amp_enabled):
-            # outputs_1: logits, feat_1: proj(128维), feat_1_raw: y4.F (cs[8]维)
-            outputs_1, feat_1, x_raw = self.model(inputs_1)
+            # 1. 前向传播：弱视图 x^W (L_Sup, Memory Bank Update)
+            outputs_1, feat_1, _ = self.model(inputs_1)
 
             if outputs_1.requires_grad:
-                # L_Seg (loss_1) 保持不变，如果需要 Focal Loss/逆频率加权，应在 self.criterion 中实现
-                loss_1 = self.criterion(outputs_1, targets_1)
 
-        if outputs_1.requires_grad:
-            targets_cuda = targets_1
+                # --- [GAFA: L_Focus] 类别聚焦损失 ---
 
-            x_raw_detached = SparseTensor(x_raw.F.detach(), x_raw.C, x_raw.s)
-            x_raw_detached.F.requires_grad = True
+                # [修复 1/2: 解决 TypeError - 临时创建 reduction='none' 损失函数]
+                # 1. 安全获取 ignore_index (来自原始 criterion)
+                try:
+                    ignore_index = self.criterion.ignore_index
+                except AttributeError:
+                    # 如果没有该属性，则使用配置中的默认值
+                    ignore_index = configs.data.ignore_label
 
-            # === 新增：创建 Thing Class 掩码 ===
-            thing_mask = torch.zeros_like(targets_cuda, dtype=torch.bool)
-            for thing_id in self.things_class_ids:
-                thing_mask |= (targets_cuda == thing_id)
+                    # 2. 临时创建一个 reduction='none' 的实例，用于逐点损失计算
+                # 必须将其放在 CUDA 上
+                criterion_none = nn.CrossEntropyLoss(
+                    ignore_index=ignore_index,
+                    reduction='none'
+                ).cuda()
 
-            # 至少需要一个 Thing Class 点才能启用加权扰动损失，否则使用干净特征作为 Query
-            if thing_mask.sum() > 0:
-                with amp.autocast(enabled=self.amp_enabled):
-                    # 1.1 优化 G_Adv (最大化不确定性 U)
-                    delta_x = self.adv_generator(x_raw_detached)  # G_Adv 在所有点上生成扰动
+                # 1.1 计算逐点分割损失 (用于加权)
+                loss_1_seg_pointwise = criterion_none(outputs_1, targets_1)
 
-                    # L_inf 约束和应用扰动 (在特征张量 F 上进行)
-                    delta_F_clamped = torch.clamp(delta_x.F, -self.adv_epsilon, self.adv_epsilon)
+                # 1.2 RCDW (类别聚焦加权)
+                W_Focus = torch.ones_like(targets_1, dtype=torch.float32) * self.stuff_adv_weight
+                for thing_id in self.things_class_ids:
+                    W_Focus[targets_1 == thing_id] = self.thing_adv_weight
 
-                    # 构建硬样本特征 F_hard: 干净特征 + 局部扰动
-                    feat_hard_raw_F = x_raw.F.clone()
-                    # 将扰动添加到所有点上，即全局扰动
-                    feat_hard_raw_F += delta_F_clamped
+                # 屏蔽掉 ignore_label
+                ignore_mask = (targets_1 != ignore_index).float()
+                W_Focus = W_Focus * ignore_mask
 
-                    # 1.2 计算不确定性 U (预测熵)
-                    outputs_hard_logits = self.model.predict_head(feat_hard_raw_F.float())
-                    outputs_hard_logsoftmax = nn.functional.log_softmax(outputs_hard_logits, dim=1)
-                    U_hard = -torch.sum(torch.exp(outputs_hard_logsoftmax) * outputs_hard_logsoftmax, dim=1)  # 逐点熵
+                # 计算加权损失（只对非忽略标签的像素进行平均）
+                # loss_1_seg_pointwise 是一个稀疏张量，这里使用 sum() / sum(mask) 实现 mean()
+                loss_Focus = (loss_1_seg_pointwise * W_Focus).sum() / ignore_mask.sum().clamp(min=1)
 
-                    # 1.3 === 核心修改：加权 G_Adv 损失 ===
-                    W_Adv = torch.ones_like(U_hard) * self.stuff_adv_weight
-                    W_Adv[thing_mask] = self.thing_adv_weight  # Thing Classes 权重更高
+                loss_Sup = loss_Focus  # L_Sup 被 L_Focus 取代
 
-                    # L_Adv_U 损失：最大化加权后的 U -> 损失是 -(W_Adv * U_hard).mean()
-                    loss_AdvU_generator = -(W_Adv * U_hard).mean()
+                # 2. 前向传播：强视图 x^S (L_CL Query, L_GSP Query)
+                pred_2, feat_2, _ = self.model(inputs_2)
 
-                    # G_Adv 优化步骤
-                self.adv_generator_optimizer.zero_grad()
-                self.adv_scaler.scale(loss_AdvU_generator).backward(retain_graph=True)
-                self.adv_scaler.step(self.adv_generator_optimizer)
-                self.adv_scaler.update()
+                # 3. [GAFA: L_CL] 特征一致性损失 (MoCo/PointDR 风格)
+                feat_1_norm = nn.functional.normalize(feat_1.detach(), dim=1)  # Key Feature (Detached)
+                feat_2_norm = nn.functional.normalize(feat_2, dim=1)  # Query Feature
 
-                # 2. 最终 Query 特征：使用硬样本的投影特征 F_hard
-                feat_2_query = self.model.proj(feat_hard_raw_F.detach().float())
+                # Memory Bank 原型更新
+                feat1_proto = torch.zeros((configs.data.num_classes, feat_1_norm.shape[1]), device='cuda')
+                for ii in range(configs.data.num_classes):
+                    mask = (targets_cuda == ii)
+                    if mask.sum():
+                        feat1_proto[ii] = feat_1_norm[mask].mean(dim=0)
+                feat1_proto = (feat1_proto + 1e-8).cuda()
+                self.model.momentum_update_key_encoder(feat1_proto, init=(self.global_step == 1))
+
+                # L_CL 计算: 使用原 self.criterion (默认 reduction='mean')
+                logits = torch.mm(feat_2_norm, self.model.memo_bank.T.detach())
+                logits /= self.T
+                loss_cl = self.criterion(logits, targets_2)
+
+                # --- 4. [GAFA: L_GSP] 几何结构保持损失 ---
+                # [修复 2/2: 解决 RuntimeError - 使用 Batch-Level 对齐]
+
+                # 计算批次平均特征（仅对非零特征）
+                feat_1_avg = feat_1.mean(dim=0)
+                feat_2_avg = feat_2.mean(dim=0)
+
+                # L_GSP (使用批次特征平均 L2 损失，避免尺寸不匹配)
+                loss_gsp = torch.mean(torch.pow(feat_1_avg - feat_2_avg, 2))
+
+                # 5. 最终损失
+                loss = loss_Sup + self.lamda * loss_cl + self.lambda_gsp * loss_gsp
+
+                self.summary.add_scalar('loss', loss.item())
+                self.summary.add_scalar('loss_Sup', loss_Sup.item())
+                self.summary.add_scalar('loss_CL', loss_cl.item())
+                self.summary.add_scalar('loss_GSP', loss_gsp.item())
+
+                self.optimizer.zero_grad()
+                self.scaler.scale(loss).backward()
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+                self.scheduler.step()
+                return {'outputs': outputs_1, 'targets': targets_1}
 
             else:
-                # Batch 中没有 Thing Class，跳过 G_Adv 优化
-                logger.debug("Skipping G_Adv step: No Thing Classes found.")
-                loss_AdvU_generator = torch.zeros(1, device='cuda', dtype=torch.float32)
+                # 评估模式
+                invs = feed_dict['inverse_map']
+                all_labels = feed_dict['targets_mapped']
+                _outputs = []
+                _targets = []
+                for idx in range(invs.C[:, -1].max() + 1):
+                    cur_scene_pts = (inputs_1.C[:, -1] == idx).cpu().numpy()
+                    cur_inv = invs.F[invs.C[:, -1] == idx].cpu().numpy()
+                    cur_label = (all_labels.C[:, -1] == idx).cpu().numpy()
+                    outputs_mapped = outputs_1[cur_scene_pts][cur_inv].argmax(1)
+                    targets_mapped = all_labels.F[cur_label]
+                    _outputs.append(outputs_mapped)
+                    _targets.append(targets_mapped)
+                outputs = torch.cat(_outputs, 0)
+                targets = torch.cat(_targets, 0)
 
-                # 2. 最终 Query 特征：使用干净样本的投影特征 (无扰动)
-                feat_2_query = self.model.proj(x_raw.F.detach().float())
-
-            # 3. 对比损失 (L_con) 计算 (与之前逻辑相同)
-            feat_1_norm = nn.functional.normalize(feat_1.detach(), dim=1)
-            feat_2_norm = nn.functional.normalize(feat_2_query, dim=1)
-
-            feat1_proto = torch.zeros((configs.data.num_classes, feat_1_norm.shape[1]), device='cuda')
-            for ii in range(configs.data.num_classes):
-                mask = (targets_1 == ii)
-                if mask.sum():
-                    feat1_proto[ii] = feat_1_norm[mask].mean(dim=0)
-            feat1_proto = (feat1_proto + 1e-8).cuda()
-
-            logits = torch.mm(feat_2_norm, self.model.memo_bank.T.detach())
-            logits /= self.T
-            # L_CL (loss_2) 保持不变
-            loss_2 = self.criterion(logits, targets_cuda)
-
-            self.model.momentum_update_key_encoder(feat1_proto.detach(), init=(self.global_step == 1))
-
-            # final loss
-            loss = loss_1 + self.lamda * loss_2
-
-            self.summary.add_scalar('loss', loss.item())
-            self.summary.add_scalar('loss_1', loss_1.item())
-            self.summary.add_scalar('loss_CL', loss_2.item())
-            self.summary.add_scalar('loss_AdvU_G', loss_AdvU_generator.item())
-
-            # 主模型优化步骤
-            self.optimizer.zero_grad()
-            self.scaler.scale(loss).backward()
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
-            self.scheduler.step()
-
-            return {'outputs': outputs_1, 'targets': targets_1}
-
-        else:
-            invs = feed_dict['inverse_map']
-            all_labels = feed_dict['targets_mapped']
-            _outputs = []
-            _targets = []
-            for idx in range(invs.C[:, -1].max() + 1):
-                cur_scene_pts = (inputs_1.C[:, -1] == idx).cpu().numpy()
-                cur_inv = invs.F[invs.C[:, -1] == idx].cpu().numpy()
-                cur_label = (all_labels.C[:, -1] == idx).cpu().numpy()
-                outputs_mapped = outputs_1[cur_scene_pts][cur_inv].argmax(1)
-                targets_mapped = all_labels.F[cur_label]
-                _outputs.append(outputs_mapped)
-                _targets.append(targets_mapped)
-            outputs = torch.cat(_outputs, 0)
-            targets = torch.cat(_targets, 0)
-
-            return {'outputs': outputs, 'targets': targets}
+                return {'outputs': outputs, 'targets': targets}
 
     def _after_epoch(self) -> None:
         self.model.eval()
@@ -250,10 +199,6 @@ class RobustTrainer(Trainer):
         state_dict['scaler'] = self.scaler.state_dict()
         state_dict['optimizer'] = self.optimizer.state_dict()
         state_dict['scheduler'] = self.scheduler.state_dict()
-        state_dict['adv_generator'] = self.adv_generator.state_dict()
-        state_dict['adv_optimizer'] = self.adv_generator_optimizer.state_dict()
-        state_dict['adv_scaler'] = self.adv_scaler.state_dict()
-
         return state_dict
 
     def _load_state_dict(self, state_dict: Dict[str, Any]) -> None:
@@ -261,9 +206,6 @@ class RobustTrainer(Trainer):
         self.scaler.load_state_dict(state_dict.pop('scaler'))
         self.optimizer.load_state_dict(state_dict['optimizer'])
         self.scheduler.load_state_dict(state_dict['scheduler'])
-        self.adv_generator.load_state_dict(state_dict['adv_generator'])
-        self.adv_generator_optimizer.load_state_dict(state_dict['adv_optimizer'])
-        self.adv_scaler.load_state_dict(state_dict['adv_scaler'])
 
     def _load_previous_checkpoint(self, checkpoint_path: str) -> None:
         pass
@@ -334,7 +276,8 @@ class RobustTrainer(Trainer):
 
 
 def evaluate(val_loader, model):
-    mIoU = MeanIoU(name=f'iou/test_', num_classes=19, ignore_label=255)
+    # 假设 configs.data.num_classes 和 configs.data.ignore_label 存在
+    mIoU = MeanIoU(name=f'iou/test_', num_classes=configs.data.num_classes, ignore_label=configs.data.ignore_label)
     mIoU.before_epoch()
 
     with torch.no_grad():
@@ -344,6 +287,7 @@ def evaluate(val_loader, model):
                 if not 'name' in key:
                     _inputs[key] = value.cuda()
             inputs = _inputs['lidar']
+            # 评估时，只返回 outputs 和 feature
             outputs, _, _ = model(inputs)
 
             invs = feed_dict['inverse_map']

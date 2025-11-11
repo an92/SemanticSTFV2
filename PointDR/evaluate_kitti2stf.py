@@ -71,7 +71,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', default="/home/SemanticSTFV2/PointDR/configs/aug_minkunet.yaml",
                         help='config file')
-    parser.add_argument('--checkpoint_path', default="/home/SemanticSTFV2/runs/aug_minkunet_62502991/checkpoints/best_epoch.pt",
+    parser.add_argument('--checkpoint_path', default="/home/SemanticSTFV2/runs/aug_minkunet_62739653/checkpoints/best_epoch.pt",
                         help='checkpoint_path')
     parser.add_argument('--name', type=str, default='minkunet', help='model name')
     parser.add_argument('--save_pred', type=str, default=None, help='save prediction dir, do not save if none')

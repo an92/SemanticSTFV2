@@ -120,9 +120,11 @@ def apply_physical_attenuation_model(block: np.ndarray, labels: np.ndarray, ids:
 def apply_selective_range_jittering(block: np.ndarray, labels: np.ndarray, ids: np.ndarray, config: Dict[str, Any]) -> \
         Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    SJ: 选择性范围抖动 (Range Jittering)。
-    遵循 SOTA 思想：只对选定区域应用距离依赖的抖动，并进行裁剪。
-    """
+        RJ: 全局范围抖动 (Global Range Jittering)。
+        对点云中所有点应用距离依赖的抖动，并进行裁剪。
+        这个函数是从原来的 apply_selective_range_jittering 修改而来。
+        """
+    # 注意: 如果您在 YAML 中保留了 'selective_range_jittering' 的名字，这里仍然使用它
     cfg = config['selective_range_jittering']
 
     if np.random.rand() >= cfg.get('prob', 1.0) or block.shape[0] == 0:
@@ -131,48 +133,21 @@ def apply_selective_range_jittering(block: np.ndarray, labels: np.ndarray, ids: 
     coords = block[:, :3]
     distances = np.linalg.norm(coords, axis=1)
 
-    # --- 1. 区域选择 (Selection Mask) ---
-    mode_prob_angle = cfg.get('mode_prob_angle', 0.5)
+    # ----------------------------------------------------------------
+    # --- 关键修改：移除 1. 区域选择 (Selection Mask) 逻辑 ---
+    # 我们将 mask_angles 设为 True，使 Range Jittering 应用于所有点
+    # ----------------------------------------------------------------
 
-    if np.random.rand() < mode_prob_angle:
-        # 角度选择模式 (ASJ 思想)
-        angles = np.arctan2(coords[:, 1], coords[:, 0])  # 水平角 (-pi to pi)
-        angle_range = np.pi * 2
+    # --- 2. 应用 Range Jittering (RJ) 到所有点 ---
+    # 由于是全局应用，selected_coords 和 selected_distances 就是 coords 和 distances
+    selected_coords = coords
+    selected_distances = distances
 
-        # 随机选择一个区间中心和宽度，确保环绕
-        min_angle_center = np.random.uniform(-np.pi, np.pi)
-        # 随机选择 15度 (pi/12) 到 45度 (pi/4) 之间的宽度
-        angle_width = np.random.uniform(np.pi / 12, np.pi / 4)
-
-        min_angle = min_angle_center - angle_width / 2
-        max_angle = min_angle_center + angle_width / 2
-
-        # 处理角度环绕：使用模运算来判断是否在范围内
-        mask_angles = np.logical_or(
-            (angles >= min_angle) & (angles <= max_angle),
-            (angles >= min_angle + angle_range) & (angles <= max_angle + angle_range)
-        )
-
-    else:
-        # 深度选择模式 (DSJ 思想)
-        max_dist = distances.max()
-        # 随机选择一个距离区间 (例如 5m 到 20m 之间的窗口)
-        dist_window = np.random.uniform(5.0, 20.0)
-
-        # 确保窗口起点在最大距离内
-        min_dist = np.random.uniform(0, max_dist - dist_window)
-        max_dist = min_dist + dist_window
-
-        mask_angles = (distances >= min_dist) & (distances <= max_dist)
-
-    # 如果没有点被选中，直接返回
-    if not np.any(mask_angles):
+    # 如果没有点，直接返回（虽然已经被 if block.shape[0] == 0 捕获，但保留严谨性）
+    if selected_coords.shape[0] == 0:
         return block, labels, ids
 
-    # --- 2. 应用 Range Jittering (RJ) ---
-    selected_coords = coords[mask_angles]
-    selected_distances = distances[mask_angles]
-
+    # 保留距离依赖的 std 计算 (这是您的特色)
     base_std = cfg.get('jitter_base_std', 0.01)
     dist_factor = cfg.get('jitter_dist_factor', 0.0005)
 
@@ -196,13 +171,14 @@ def apply_selective_range_jittering(block: np.ndarray, labels: np.ndarray, ids: 
     # 避免除以零
     selected_distances[selected_distances == 0] = 1e-6
 
+    # 计算缩放因子，将所有点的距离从 R 变为 R'
     scaling_factor = new_R / selected_distances
     selected_coords *= scaling_factor[:, np.newaxis]
 
-    # 6. 更新 block
-    block[mask_angles, :3] = selected_coords
+    block[:, :3] = selected_coords
 
     return block, labels, ids
+
 
 
 def apply_intensity_channel_distortion(block: np.ndarray, labels: np.ndarray, ids: np.ndarray,

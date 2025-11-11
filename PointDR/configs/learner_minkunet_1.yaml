@@ -1,0 +1,76 @@
+model:
+  name: minkunet_learner
+  cr: 0.5
+  ljm:
+    name: learnable_jitter_module
+    in_channels: 4
+    hidden_channels: 32
+    max_sigma: 0.02 # LJM 允许的最大几何扰动，例如 5cm
+
+  adm:
+    name: adversarial_drop_module
+    in_channels: 4
+    hidden_channels: 32
+
+  laa_loss:
+    lambda_adv: 1.0          # 对抗性损失 (L_drop + H_drop) 的权重
+    lambda_drop_reg: 0.1     # 丢弃率正则化项的权重
+    target_drop_ratio: 0.15   # 目标丢弃率 (例如 10%)
+
+data:
+  num_classes: 19
+  ignore_label: 255
+  training_size: 19132
+
+train:
+  seed: 1588147245
+  deterministic: False
+
+src_dataset:
+  name: semanticRawkitti  # 数据没有做任何处理，原始点云数据进行训练
+  root: /home/dataset/SemanticKITTI/sequences
+  num_points: 80000
+  voxel_size: 0.05
+
+#tgt_dataset:
+#  name: semantickitti    # kitti数据进行测试
+#  root: /home/dataset/SemanticKITTI/sequences
+#  num_points: 80000
+#  voxel_size: 0.05
+
+tgt_dataset:
+  name: semanticstf
+  root: /home/dataset/SemanticSTF
+  num_points: 80000
+  voxel_size: 0.05
+
+num_epochs: 30
+batch_size: 8
+
+criterion:
+  name: cross_entropy
+  ignore_index: 255
+
+optimizer:
+  name: sgd
+  lr: 2.4e-1
+  weight_decay: 1.0e-4
+  momentum: 0.9
+  nesterov: true
+
+scheduler:
+  name: cosine_warmup
+
+optimizer_ljm:
+  name: adam     # LJM/ADM 常用 Adam 或 AdamW
+  lr: 1.0e-4     # 学习率通常比主干网络低 (例如 1e-4)
+  weight_decay: 1.0e-5
+
+optimizer_adm:
+  name: adam
+  lr: 1.0e-4
+  weight_decay: 1.0e-5
+
+workers_per_gpu: 8
+distributed: False
+amp_enabled: True

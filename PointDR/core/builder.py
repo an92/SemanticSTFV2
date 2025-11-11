@@ -1,4 +1,4 @@
-from typing import Callable
+from typing import Callable, Iterable
 
 import torch
 import torch.optim
@@ -123,6 +123,13 @@ def make_model() -> nn.Module:
         else:
             cr = 1.0
         model = MinkUNet_Robust(num_classes=configs.data.num_classes, cr=cr)
+    elif configs.model.name == 'minkunet_learner':
+        from core.models.semantic_kitti import MinkUNet_Learner
+        if 'cr' in configs.model:
+            cr = configs.model.cr
+        else:
+            cr = 1.0
+        model = MinkUNet_Learner(num_classes=configs.data.num_classes, cr=cr, ljm_config=configs.model.ljm, adm_config=configs.model.adm,)
     else:
         raise NotImplementedError(configs.model.name)
     return model
@@ -157,6 +164,27 @@ def make_optimizer(model: nn.Module) -> Optimizer:
         raise NotImplementedError(configs.optimizer.name)
     return optimizer
 
+
+def make_parms_optimizer(params, config) -> Optimizer:
+    if config.name == 'sgd':
+        optimizer = torch.optim.SGD(params, # 传入分离后的参数列表
+                                    lr=config.lr,
+                                    momentum=config.momentum,
+                                    weight_decay=config.weight_decay,
+                                    nesterov=config.nesterov)
+    elif config.name == 'adam':
+        optimizer = torch.optim.Adam(
+            params, # 传入分离后的参数列表
+            lr=config.lr,
+            weight_decay=config.weight_decay)
+    elif config.name == 'adamw':
+        optimizer = torch.optim.AdamW(
+            params, # 传入分离后的参数列表
+            lr=config.lr,
+            weight_decay=config.weight_decay)
+    else:
+        raise NotImplementedError(config.name)
+    return optimizer
 
 def make_scheduler(optimizer: Optimizer) -> Scheduler:
     if configs.scheduler.name == 'none':

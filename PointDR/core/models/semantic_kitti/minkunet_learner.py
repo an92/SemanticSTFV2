@@ -1,9 +1,16 @@
+from typing import Tuple
+
 import torch
 import torch.nn as nn
 import torchsparse
 import torchsparse.nn as spnn
+import torch.nn.functional as F
 
-__all__ = ['MinkUNet_Robust']
+
+__all__ = ['MinkUNet_Learner']
+
+from torchsparse import SparseTensor
+
 
 class BasicConvolutionBlock(nn.Module):
 
@@ -74,7 +81,124 @@ class ResidualBlock(nn.Module):
         out = self.relu(self.net(x) + self.downsample(x))
         return out
 
-class MinkUNet_Robust(nn.Module):
+
+class LearnableJitterModule(nn.Module):
+    def __init__(self, in_channels: int, hidden_channels: int, max_sigma: float = 0.05) -> None:
+        super().__init__()
+        self.max_sigma = max_sigma
+        self.mlp = nn.Sequential(
+            nn.Linear(3, hidden_channels), nn.ReLU(),
+            nn.Linear(hidden_channels, hidden_channels), nn.ReLU(),
+            nn.Linear(hidden_channels, 1), nn.Sigmoid()
+        )
+        nn.init.constant_(self.mlp[-2].bias, -2.0)
+
+    def forward(self, points_F: torch.Tensor) -> torch.Tensor:
+        coords = points_F[:, :3]
+        sigma_factor = self.mlp(coords)
+        sigma = sigma_factor * self.max_sigma
+        noise = torch.randn_like(coords) * sigma
+        jittered_F = points_F.clone()
+        jittered_F[:, :3] = coords + noise
+        return jittered_F
+
+
+class AdversarialDropModule(nn.Module):
+    def __init__(self, in_channels: int, hidden_channels: int) -> None:
+        super().__init__()
+        self.policy_net = nn.Sequential(
+            nn.Linear(in_channels + 2, hidden_channels), nn.ReLU(),
+            nn.Linear(hidden_channels, 1), nn.Sigmoid()
+        )
+
+    def forward(
+            self,
+            lidar: 'SparseTensor',
+            L_aug: torch.Tensor,
+            H_aug: torch.Tensor,
+            hard_threshold: float = 0.5,
+            dual_forward: bool = True,
+    ) -> Tuple['SparseTensor', torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            lidar: SparseTensor 输入点云
+            L_aug, H_aug: 上游 supervision scalar
+            hard_threshold: 控制 Gumbel-soft 硬化温度
+            dual_forward: 是否启用双路径 (soft + hard) forward
+        """
+        points_F = lidar.F
+        N_total = points_F.shape[0]
+        device = points_F.device
+
+        # --- 拼接输入特征 ---
+        L_H_state = torch.cat([
+            L_aug.unsqueeze(0).expand(N_total, 1),
+            H_aug.unsqueeze(0).expand(N_total, 1)
+        ], dim=1)
+        policy_input = torch.cat([points_F, L_H_state], dim=1)
+
+        p_drop = self.policy_net(policy_input)  # (N, 1) 丢弃概率
+
+        # ============================================================
+        # ✅ Gumbel-Soft + Straight-Through Estimator
+        # ============================================================
+        if dual_forward:
+            # 软采样：可微的 Drop mask
+            gumbel_noise = -torch.log(-torch.log(torch.rand_like(p_drop) + 1e-9) + 1e-9)
+            drop_mask_soft = torch.sigmoid((torch.log(p_drop + 1e-9) - gumbel_noise) / hard_threshold)
+            # 硬采样：实际索引使用
+            drop_mask_hard = (drop_mask_soft > 0.5).float()
+            drop_mask = drop_mask_soft + (drop_mask_hard - drop_mask_soft).detach()
+        else:
+            # 普通 Bernoulli-ST
+            drop_mask_hard = (torch.rand_like(p_drop) > p_drop).float()
+            drop_mask = p_drop + (drop_mask_hard - p_drop).detach()
+
+        # ============================================================
+        # ✅ 硬索引：用于生成新的 SparseTensor
+        # ============================================================
+        keep_indices = torch.nonzero(drop_mask_hard.squeeze()).squeeze(1)
+        if keep_indices.numel() == 0:
+            dropped_lidar = SparseTensor(
+                torch.empty(0, points_F.shape[1], device=device),
+                torch.empty(0, lidar.C.shape[1], dtype=lidar.C.dtype, device=device)
+            )
+            actual_drop_ratio = torch.tensor(1.0, device=device)
+        else:
+            dropped_lidar = SparseTensor(
+                points_F[keep_indices],
+                lidar.C[keep_indices]
+            )
+            actual_drop_ratio = 1.0 - (keep_indices.numel() / N_total)
+
+        # ============================================================
+        # ✅ 可微 Drop Ratio (STE)
+        # ============================================================
+        drop_ratio_soft = p_drop.mean()
+        drop_ratio_ste = drop_ratio_soft + (actual_drop_ratio - drop_ratio_soft).detach()
+
+        # ============================================================
+        # ✅ 双路径正则：soft mask 熵约束（增强梯度学习信号）
+        # ============================================================
+        if dual_forward:
+            mask_entropy = - (drop_mask_soft * torch.log(drop_mask_soft + 1e-9)
+                              + (1 - drop_mask_soft) * torch.log(1 - drop_mask_soft + 1e-9))
+            mask_entropy = mask_entropy.mean()
+            drop_ratio_ste = drop_ratio_ste + 0.05 * mask_entropy  # 调整 0.05 可平衡可微性与稳定性
+
+        return dropped_lidar, drop_ratio_ste, keep_indices
+
+# 辅助函数：计算熵 (同 LPD 论文)
+def compute_entropy(logits):
+    # logits shape: (N_points, Num_Classes)
+    probs = torch.softmax(logits, dim=-1)
+    # H = - (1/N) * sum(P * log(P))
+    # 这里的平均是针对所有点
+    entropy = - (probs * torch.log(probs + 1e-9)).sum(dim=-1).mean()
+    return entropy  # Scalar
+
+
+class MinkUNet_Learner(nn.Module):
 
     def __init__(self, **kwargs):
         super().__init__()
@@ -82,8 +206,26 @@ class MinkUNet_Robust(nn.Module):
         cr = kwargs.get('cr', 1.0)
         cs = [32, 32, 64, 128, 256, 256, 128, 96, 96]
         cs = [int(cr * x) for x in cs]
-        self._raw_feat_dim = cs[8]  # 记录原始特征维度
         self.run_up = kwargs.get('run_up', True)
+
+        # 确保配置存在且是字典
+        ljm_config = kwargs['ljm_config']
+        adm_config = kwargs['adm_config']
+
+        ljm_in_channels = ljm_config.get('in_channels', 4)
+
+        self.ljm = LearnableJitterModule(
+            in_channels=ljm_in_channels,
+            hidden_channels=ljm_config.get('hidden_channels', 32),  # 默认为 32
+            max_sigma=ljm_config.get('max_sigma', 0.05)  # 默认为 0.05
+        )
+
+        adm_in_channels = adm_config.get('in_channels', 4)
+
+        self.adm = AdversarialDropModule(
+            in_channels=adm_in_channels,
+            hidden_channels=adm_config.get('hidden_channels', 32)
+        )
 
         self.stem = nn.Sequential(
             spnn.Conv3d(4, cs[0], kernel_size=3, stride=1),
@@ -169,27 +311,6 @@ class MinkUNet_Robust(nn.Module):
         self.weight_initialization()
         self.dropout = nn.Dropout(0.3, True)
 
-        # projection head
-        self.proj = nn.Sequential(
-            nn.Linear(cs[8], cs[8]),
-            nn.ReLU(inplace=True),
-            nn.Linear(cs[8], 128))
-
-        # create the momentum memory bank to save prototypes
-        self.m = 0.99  # momentum update rate
-        self.register_buffer("memo_bank", torch.randn(kwargs['num_classes'], 128))
-        self.memo_bank = self.memo_bank * 0.
-
-    @torch.no_grad()
-    def momentum_update_key_encoder(self, feat, init=False):
-        """
-        Momentum update of the memo_bank
-        """
-        if init:
-            self.memo_bank = feat
-        else:
-            self.memo_bank = self.memo_bank * self.m + feat * (1. - self.m)
-
     def weight_initialization(self):
         for m in self.modules():
             if isinstance(m, nn.BatchNorm1d):
@@ -219,18 +340,6 @@ class MinkUNet_Robust(nn.Module):
         y4 = torchsparse.cat([y4, x0])
         y4 = self.up4[1](y4)
 
-        raw_feat = y4  # cs[8]维特征
-
         out = self.classifier(y4.F)
 
-        feat = self.proj(y4.F)
-
-        return out, feat, raw_feat
-
-    def predict_head(self, feat_tensor):
-        """
-        接收特征张量 (维度 cs[8])，计算分类 logits。
-        用于 Trainer 中计算硬样本 F_hard 的预测熵 U。
-        """
-        # 传入的 feat_tensor 必须是 cs[8] 维
-        return self.classifier(feat_tensor)
+        return out, None

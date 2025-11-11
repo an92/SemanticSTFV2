@@ -6,8 +6,11 @@ data:
 model:
   name: minkunet_robust
   cr: 0.5
-  adv_lambda: 0.05
-  adv_epsilon: 0.1
+  lambda_gsp: 0.05
+  lambda_cl: 0.1
+  things_class_ids: [ 0, 1, 2, 3, 4, 5, 6, 7, 13, 17, 18 ]
+  things_weights: 5.0
+  stuff_weights: 1.0
 
 train:
   seed: 1588147245
@@ -45,13 +48,13 @@ src_dataset:
 
     # --- 物理衰减模型 (PMA) ---
     - name: physical_attenuation_model
-      prob: 0.5
+      prob: 0.8
       alpha_min: 0.005 # 薄雾
-      alpha_max: 0.05  # 浓雾/暴雪
+      alpha_max: 0.1  # 浓雾/暴雪
 
     # 选择性几何抖动 (SJ) ---
     - name: selective_range_jittering
-      prob: 0.5  # SOTA DSJ/ASJ 的概率是 0.5
+      prob: 0.8  # SOTA DSJ/ASJ 的概率是 0.5
       mode_prob_angle: 0.5
       jitter_base_std: 0.01
       jitter_dist_factor: 0.0005
@@ -63,6 +66,13 @@ src_dataset:
       gamma_prob: 0.5
       gamma_min: 0.7
       gamma_max: 1.3
+
+    - name: add_noise_points
+      prob: 0.3
+      min_num: 100
+      max_num: 1000
+      intensity_scale: 0.1
+
 
 #tgt_dataset:
 #  name: semantickitti
