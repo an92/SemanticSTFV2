@@ -1,9 +1,7 @@
 model:
   name: minkunet_learner
   cr: 0.5
-  alpha_grl: 0.1
-  lambda_bawa: 1.0
-  lambda_mask: 0.1
+  multi_proto: 2
 
 data:
   num_classes: 19
@@ -15,13 +13,51 @@ train:
   deterministic: False
 
 src_dataset:
-  name: semantic_learner
+  name: semanticAugkitti
   root: /home/dataset/SemanticKITTI/sequences
   num_points: 80000
   voxel_size: 0.05
 
+  # --- Weak Aug 流程 ---
+  weak_aug:
+    - name: rotate_scale         # 旋转和缩放
+      prob: 1.0
+      min_angle: 0.0
+      max_angle: 6.283185 # 2 * pi
+      min_scale: 0.95
+      max_scale: 1.05
+
+  # --- 定义 Strong Aug 流程---
+  strong_aug:
+    - name: rotate_scale
+      prob: 1.0
+      min_angle: 0.0
+      max_angle: 6.283185 # 2 * pi
+      min_scale: 0.95
+      max_scale: 1.05
+
+    - name: flip_axis
+      prob: 1.0
+      prob_x: 0.5
+      prob_y: 0.5
+
+    - name: weather_layered_augmentation
+      prob: 1.0
+      weather_prob:
+        snow: 0.3
+        rain: 0.3
+        fog: 0.2
+        thin_fog: 0.2
+      drop_prob_small: 0.3
+      drop_prob_large: 0.05
+      cluster_size: 10
+      num_clusters: 5
+      sigma_local: 0.02
+      depth_sigma: 0.02
+      noise_ratio: 0.005
+
 #tgt_dataset:
-#  name: semantickitti    # kitti数据进行测试
+#  name: semantickitti
 #  root: /home/dataset/SemanticKITTI/sequences
 #  num_points: 80000
 #  voxel_size: 0.05

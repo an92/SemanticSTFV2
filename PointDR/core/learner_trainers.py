@@ -4,7 +4,6 @@ import torch.nn.functional as F
 from torch import nn
 from torch.cuda import amp
 from torchpack.train import Trainer
-from torchpack.utils.typing import Optimizer, Scheduler
 
 import time
 from typing import Any, Dict, List, Optional, Callable
@@ -18,25 +17,24 @@ from torchpack.utils.logging import logger
 from core.callbacks import MeanIoU
 import tqdm
 
+# kNN utility
+from torch_geometric.nn import knn_graph  # 确保安装 torch_geometric
+
 __all__ = ['MinkUnetLearnerTrainer']
 
-from torchsparse import SparseTensor
+THING_NAMES = set([
+    'car', 'bicycle', 'motorcycle', 'truck', 'bus',
+    'person', 'bicyclist', 'motorcyclist', 'fence',
+    'pole', 'traffice-sign',
+])
 
 
 class MinkUnetLearnerTrainer(Trainer):
-    def __init__(self,
-                 model: nn.Module,
-                 criterion: Callable,
-                 optimizer: Optimizer,
-                 scheduler: Scheduler,
-                 num_workers: int,
-                 seed: int,
-                 amp_enabled: bool = False,
-                 lambda_mask: float = 0.1,
-                 lambda_bawa: float = 1.0):
-        """
-        LearnerTrainer for MinkUNet + DBAG + BAWA.
-        """
+
+    def __init__(self, model: nn.Module, criterion: Callable, optimizer: torch.optim.Optimizer,
+                 scheduler: Callable, num_workers: int, seed: int, amp_enabled: bool = False,
+                 total_steps: int = 100000):
+        super().__init__()
         self.model = model
         self.criterion = criterion
         self.optimizer = optimizer
@@ -47,184 +45,217 @@ class MinkUnetLearnerTrainer(Trainer):
         self.scaler = amp.GradScaler(enabled=self.amp_enabled)
         self.epoch_num = 1
 
-        self.eval_interval = 500
-        self.lambda_mask = lambda_mask
-        self.lambda_bawa = lambda_bawa
+        self.lamda_memory = 0.5
+        self.lamda_fcr = 1.0
+        self.lamda_cwcl = 0.5
+        self.T = 0.07
+        self.teacher_momentum = 0.99
+        self.teacher_momentum_warmup = True
+        self.total_steps = total_steps
+        self.multi_proto = 2
 
-    def _before_epoch(self) -> None:
+        # 确保 teacher 初始化
+        if hasattr(self.model, 'init_teacher'):
+            self.model.init_teacher()
+
+    def _before_epoch(self):
         self.model.train()
-        self.dataflow.sampler.set_epoch(self.epoch_num - 1)
-        self.dataflow.worker_init_fn = lambda worker_id: np.random.seed(
-            self.seed + (self.epoch_num - 1) * self.num_workers + worker_id
+        if hasattr(self.dataflow.sampler, 'set_epoch'):
+            self.dataflow.sampler.set_epoch(self.epoch_num - 1)
+        self.dataflow.worker_init_fn = lambda wid: np.random.seed(
+            self.seed + (self.epoch_num - 1) * self.num_workers + wid
         )
 
+    def _compute_memory_infoNCE(self, feat_weather, feat_proto, targets, sample_weights):
+        """
+        Memory-based InfoNCE (prototype memory)
+        """
+        logits_mem = torch.mm(feat_weather, feat_proto.T) / self.T
+        mask_valid = (targets != 255)
+        targets_clamped = targets.clone()
+        targets_clamped[targets_clamped == 255] = 0
+        log_probs = F.log_softmax(logits_mem, dim=1)
+        nll = -log_probs.gather(1, targets_clamped.unsqueeze(1)).squeeze(1)
+        nll[~mask_valid] = 0.0
+        loss = (nll * sample_weights).sum() / sample_weights[mask_valid].sum().clamp(min=1.0)
+        return loss
+
+    def _compute_CWCL_knn(self, feat_clean, feat_weather, targets, sample_weights, neg_sample_ratio=50):
+        """
+        高效 CWCL：
+        - feat_clean: [N, C] 对齐点
+        - feat_weather: [N, C] 对齐点
+        - targets: [N]
+        - sample_weights: [N]
+        """
+        N, C = feat_clean.shape
+
+        # 1. 正样本相似度
+        sim_pos = (feat_clean * feat_weather).sum(dim=1) / self.T  # [N]
+
+        # 2. 随机负样本索引（每个点采样 neg_sample_ratio 个负样本）
+        neg_idx = torch.randint(0, N, (N, neg_sample_ratio), device=feat_clean.device)
+        feat_neg = feat_weather[neg_idx]  # [N, neg_sample_ratio, C]
+
+        # 3. 正样本 + 负样本相似度
+        feat_clean_exp = feat_clean.unsqueeze(1)  # [N,1,C]
+        sim_all = torch.cat([sim_pos.unsqueeze(1), (feat_clean_exp * feat_neg).sum(dim=2) / self.T],
+                            dim=1)  # [N, 1+neg_sample_ratio]
+
+        # 4. log-softmax loss
+        log_probs = F.log_softmax(sim_all, dim=1)
+        loss_point = -log_probs[:, 0]  # 负 log likelihood 对正样本
+
+        mask_valid = (targets != 255)
+        loss = (loss_point * sample_weights).sum() / sample_weights[mask_valid].sum().clamp(min=1.0)
+        return loss
+
     def _run_step(self, feed_dict: Dict[str, Any]) -> Dict[str, Any]:
-        _inputs = {}
-        for key, value in feed_dict.items():
-            if 'name' in key or 'ids' in key:
-                continue
-            if isinstance(value, torch.Tensor):
-                _inputs[key] = value.cuda(non_blocking=True)
-            elif isinstance(value, SparseTensor):
-                _inputs[key] = value.cuda()
-            elif isinstance(value, list):
-                new_list = []
-                for v in value:
-                    if isinstance(v, torch.Tensor):
-                        new_list.append(v.cuda(non_blocking=True))
-                    elif isinstance(v, SparseTensor):
-                        new_list.append(v.cuda())
-                    else:
-                        new_list.append(v)
-                _inputs[key] = new_list
-            else:
-                _inputs[key] = value
+        _inputs = {k: v.cuda() for k, v in feed_dict.items() if 'name' not in k and 'ids' not in k}
+        inputs_1 = _inputs['lidar']
+        targets_1 = feed_dict['targets'].F.long().cuda(non_blocking=True)
+        inputs_2 = _inputs['lidar_2']
+        targets_2 = feed_dict['targets_2'].F.long().cuda(non_blocking=True)
+        inverse_map = feed_dict['inverse_map_dense'].F.long().cuda(non_blocking=True)
+        ids_1 = feed_dict['ids_1'].F.long().cuda(non_blocking=True)
+        ids_2 = feed_dict['ids_2'].F.long().cuda(non_blocking=True)
 
-        inputs = _inputs['lidar']
-        targets = feed_dict['targets'].F.long().cuda(non_blocking=True)
+        with amp.autocast(enabled=self.amp_enabled):
+            outputs_1, feat_clean_student = self.model(inputs_1)
 
-        if self.model.training:
-            perturb_mode = 'generate'
-            with amp.autocast(enabled=self.amp_enabled):
-                outputs, bawa_features, mask_weights = self.model(inputs, perturb_mode=perturb_mode)
+            if outputs_1.requires_grad:
+                # ------------------- 训练分支 -------------------
+                loss_seg = self.criterion(outputs_1, targets_1) if outputs_1.requires_grad else torch.tensor(0.0,
+                                                                                                             device=outputs_1.device,
+                                                                                                             requires_grad=True)
+                outputs_2, feat_weather_student = self.model(inputs_2)
 
-                loss_seg = self.criterion(outputs, targets)
-                loss_mask = 0.0
-                if mask_weights is not None:
-                    loss_mask = sum(((m - 0.5) ** 2).mean() for m in mask_weights)
-
-                loss_bawa = torch.zeros(1, device=outputs.device)
-                bawa_clean_st = _inputs['bawa_clean']  # Batch-Wide ST_clean
-
+                # teacher 特征
                 with torch.no_grad():
-                    bawa_features_clean = self.model.get_bawa_features(bawa_clean_st)
+                    feat_clean_teacher = self.model.teacher_backbone.get_features(inputs_1)
+                    feat_clean_teacher_aligned = feat_clean_teacher[inverse_map]
 
-                if 'bawa_clean' in feed_dict:
-                    aug_inv_st = _inputs['inverse_map']
-                    clean_inv_st = _inputs['inverse_map_clean']
+                # 对齐两视图点
+                ids_1_np = ids_1.cpu().numpy()
+                ids_2_np = ids_2.cpu().numpy()
+                common_ids, idx1, idx2 = np.intersect1d(ids_1_np, ids_2_np, return_indices=True)
+                idx1 = torch.from_numpy(idx1).long().cuda()
+                idx2 = torch.from_numpy(idx2).long().cuda()
 
-                    aug_orig_ids_full = aug_inv_st.F.squeeze().long()
-                    clean_orig_ids = clean_inv_st.F.squeeze().long()
+                feat_weather_aligned = feat_weather_student[idx2]
+                feat_teacher_aligned = feat_clean_teacher_aligned[idx2]
+                targets_aligned = targets_2[idx2]
+                valid_mask = (targets_aligned != 255)
 
-                    valid_clean_mask = clean_orig_ids >= 0
-                    valid_clean_orig_ids = clean_orig_ids[valid_clean_mask]
+                # FCR loss
+                l_fcr = F.mse_loss(
+                    feat_weather_aligned[valid_mask],
+                    feat_teacher_aligned[valid_mask]
+                ) if valid_mask.sum() > 0 else torch.tensor(0.0, device=feat_weather_student.device, requires_grad=True)
 
-                    clean_feature_indices = torch.arange(len(clean_orig_ids), device=outputs.device)[valid_clean_mask]
-
-                    if len(valid_clean_orig_ids) > 0:
-                        # 保护：负 ID 临时设为 0
-                        aug_orig_ids_safe = aug_orig_ids_full.clone()
-                        aug_orig_ids_safe[aug_orig_ids_safe < 0] = 0
-
-                        max_orig_id = max(aug_orig_ids_safe.max().item(), valid_clean_orig_ids.max().item())
-
-                        orig2clean_map = torch.full((max_orig_id + 1,), -1, dtype=torch.long, device=outputs.device)
-                        orig2clean_map[valid_clean_orig_ids] = clean_feature_indices
-
-                        total_overlap_points = 0.0
-
-                        for k, (f_aug_st, f_clean_st) in enumerate(zip(bawa_features, bawa_features_clean)):
-                            N_current_aug = f_aug_st.F.shape[0]
-
-                            # 取当前特征层对应的 ID
-                            aug_orig_ids_current = aug_orig_ids_full[:N_current_aug].long()
-
-                            # 过滤掉负值
-                            valid_aug_mask_current = aug_orig_ids_current >= 0
-                            aug_orig_ids_current = aug_orig_ids_current[valid_aug_mask_current]
-
-                            # 过滤掉超过查找表长度的 ID
-                            map_size = orig2clean_map.shape[0]
-                            safe_mask = aug_orig_ids_current < map_size
-                            aug_orig_ids_current = aug_orig_ids_current[safe_mask]
-                            valid_aug_indices = valid_aug_mask_current.nonzero(as_tuple=True)[0][safe_mask]
-
-                            if len(aug_orig_ids_current) == 0:
-                                continue  # 没有有效点，跳过
-
-                            # 查找对应 Clean Feature Index
-                            mapped_clean_indices_valid = orig2clean_map[aug_orig_ids_current]
-
-                            # 只保留有效索引
-                            valid_mask = mapped_clean_indices_valid >= 0
-                            final_aug_indices = valid_aug_indices[valid_mask]
-                            final_clean_indices = mapped_clean_indices_valid[valid_mask]
-
-                            if len(final_aug_indices) == 0:
-                                continue
-
-                            f_aug_valid = f_aug_st.F[final_aug_indices]
-                            aligned_clean_F = f_clean_st.F[final_clean_indices]
-
-                            diff = f_aug_valid - aligned_clean_F
-                            loss_bawa += (diff ** 2).sum()
-                            total_overlap_points += len(final_aug_indices)
-
-                        # 平均化
-                        if total_overlap_points > 0:
-                            loss_bawa = (self.lambda_bawa * loss_bawa) / total_overlap_points
-                        else:
-                            loss_bawa = torch.zeros(1, device=outputs.device)
+                # Memory prototype
+                feat_clean_norm = F.normalize(feat_clean_student, dim=1)
+                feat_weather_norm = F.normalize(feat_weather_student, dim=1)
+                feat_proto = torch.zeros((self.model.num_classes * self.model.multi_proto, feat_clean_norm.shape[1]),
+                                         device=feat_clean_norm.device)
+                for ii in range(self.model.num_classes):
+                    mask = (targets_1 == ii)
+                    if mask.sum() == 0:
+                        continue
+                    pts = feat_clean_norm[mask]
+                    if self.model.multi_proto == 1:
+                        feat_proto[ii] = pts.mean(dim=0)
                     else:
-                        loss_bawa = torch.zeros(1, device=outputs.device)
+                        pts_split = torch.chunk(pts, self.model.multi_proto, dim=0)
+                        for j, sub in enumerate(pts_split):
+                            idx = ii * self.model.multi_proto + j
+                            feat_proto[idx] = sub.mean(dim=0)
+                feat_proto = F.normalize(feat_proto + 1e-8, dim=1)
 
-                loss_total = loss_seg + self.lambda_mask * loss_mask + loss_bawa
+                # class-aware weights
+                sample_weights = torch.ones_like(targets_aligned, dtype=torch.float32)
+                try:
+                    reverse_map = self.model.teacher_backbone.reverse_label_name_mapping
+                    for name, idx in reverse_map.items():
+                        sample_weights[targets_aligned == idx] = 1.0 if name in THING_NAMES else 0.2
+                except Exception:
+                    pass
 
-            self.summary.add_scalar('loss_total', loss_total.item())
-            self.summary.add_scalar('loss_seg', loss_seg.item())
-            self.summary.add_scalar('loss_mask', loss_mask if isinstance(loss_mask, float) else loss_mask.item())
-            self.summary.add_scalar('loss_bawa', loss_bawa if isinstance(loss_bawa, float) else loss_bawa.item())
+                # memory loss
+                loss_memory = self._compute_memory_infoNCE(
+                    feat_weather_norm, feat_proto, targets_aligned, sample_weights
+                )
 
-            self.optimizer.zero_grad()
-            self.scaler.scale(loss_total).backward()
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
-            self.scheduler.step()
+                # CWCL loss
+                feat_clean_aligned = feat_clean_norm[idx1]
+                feat_weather_aligned_cw = feat_weather_norm[idx2]
+                targets_aligned_final = targets_aligned
+                sample_weights_aligned = sample_weights
+                loss_cw = self._compute_CWCL_knn(
+                    feat_clean_aligned,
+                    feat_weather_aligned_cw,
+                    targets_aligned_final,
+                    sample_weights_aligned,
+                    neg_sample_ratio=50
+                )
 
-            return {
-                'outputs': outputs,
-                'targets': targets,
-                'mask_weights': mask_weights,
-                'bawa_features': bawa_features,
-            }
+                # 总 loss
+                total_loss = loss_seg + self.lamda_memory * loss_memory + self.lamda_fcr * l_fcr + self.lamda_cwcl * loss_cw
 
-        else:
-            with torch.no_grad():
-                outputs, _, _ = self.model(inputs, perturb_mode='clean')
+                # 更新 memory bank
+                self.model.momentum_update_key_encoder(feat_proto.detach(), momentum=0.9, init=(self.global_step == 1))
 
-            # 映射到原点云
-            invs = feed_dict['inverse_map']
-            all_labels = feed_dict['targets_mapped']
-            _outputs = []
-            _targets = []
-            for idx in range(invs.C[:, -1].max() + 1):
-                cur_scene_pts = (inputs.C[:, -1] == idx).cpu().numpy()
-                cur_inv = invs.F[invs.C[:, -1] == idx].cpu().numpy()
-                cur_label = (all_labels.C[:, -1] == idx).cpu().numpy()
-                outputs_mapped = outputs[cur_scene_pts][cur_inv].argmax(1)
-                targets_mapped = all_labels.F[cur_label]
-                _outputs.append(outputs_mapped)
-                _targets.append(targets_mapped)
+                # backward
+                self.summary.add_scalar('loss', total_loss.item())
+                self.summary.add_scalar('loss_seg', float(loss_seg))
+                self.summary.add_scalar('loss_memory', float(loss_memory))
+                self.summary.add_scalar('loss_fcr', float(l_fcr))
+                self.summary.add_scalar('loss_cw', float(loss_cw))
 
-            outputs_cat = torch.cat(_outputs, 0)
-            targets_cat = torch.cat(_targets, 0)
+                self.optimizer.zero_grad()
+                self.scaler.scale(total_loss).backward()
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+                self.scheduler.step()
 
-            return {
-                'outputs': outputs_cat,
-                'targets': targets_cat,
-            }
+                # teacher EMA
+                if self.teacher_momentum_warmup:
+                    m = 1.0 - (1.0 - self.teacher_momentum) * (
+                                np.cos(np.pi * self.global_step / self.total_steps) + 1) / 2
+                else:
+                    m = self.teacher_momentum
+                self.model.update_teacher(momentum=m)
+
+                return {'outputs': outputs_1, 'targets': targets_1}
+
+            else:
+                # ------------------- 评估分支 -------------------
+                invs = feed_dict['inverse_map']
+                all_labels = feed_dict['targets_mapped']
+                _outputs, _targets = [], []
+                for idx in range(invs.C[:, -1].max() + 1):
+                    cur_scene_pts = (inputs_1.C[:, -1] == idx).cpu().numpy()
+                    cur_inv = invs.F[invs.C[:, -1] == idx].cpu().numpy()
+                    cur_label = (all_labels.C[:, -1] == idx).cpu().numpy()
+                    outputs_mapped = outputs_1[cur_scene_pts][cur_inv].argmax(1)
+                    targets_mapped = all_labels.F[cur_label]
+                    _outputs.append(outputs_mapped)
+                    _targets.append(targets_mapped)
+                outputs_cat = torch.cat(_outputs, 0)
+                targets_cat = torch.cat(_targets, 0)
+
+                return {'outputs': outputs_cat, 'targets': targets_cat}
 
     def _after_epoch(self) -> None:
         self.model.eval()
 
     def _state_dict(self) -> Dict[str, Any]:
-        state_dict = {
+        return {
             'model': self.model.state_dict(),
             'scaler': self.scaler.state_dict(),
             'optimizer': self.optimizer.state_dict(),
             'scheduler': self.scheduler.state_dict(),
         }
-        return state_dict
 
     def _load_state_dict(self, state_dict: Dict[str, Any]) -> None:
         self.model.load_state_dict(state_dict['model'])
@@ -233,17 +264,9 @@ class MinkUnetLearnerTrainer(Trainer):
         self.scheduler.load_state_dict(state_dict['scheduler'])
 
     def _load_previous_checkpoint(self, checkpoint_path: str) -> None:
-        state_dict = torch.load(checkpoint_path)
-        self._load_state_dict(state_dict)
+        pass
 
-    def train(self,
-              dataflow: DataLoader,
-              *,
-              num_epochs: int = 9999999,
-              callbacks: Optional[List[Callback]] = None) -> None:
-        """
-        完整训练循环
-        """
+    def train(self, dataflow: DataLoader, *, num_epochs: int = 9999999, callbacks: Optional[List[Callback]] = None) -> None:
         self.dataflow = dataflow
         self.steps_per_epoch = len(self.dataflow)
         self.num_epochs = num_epochs
@@ -259,14 +282,12 @@ class MinkUnetLearnerTrainer(Trainer):
 
             self.epoch_num = 0
             self.global_step = 0
-
             train_time = time.perf_counter()
             self.before_train()
 
             while self.epoch_num < self.num_epochs:
                 self.epoch_num += 1
                 self.local_step = 0
-
                 logger.info(f'Epoch {self.epoch_num}/{self.num_epochs} started.')
                 epoch_time = time.perf_counter()
                 self.before_epoch()
@@ -274,20 +295,17 @@ class MinkUnetLearnerTrainer(Trainer):
                 for feed_dict in self.dataflow:
                     self.local_step += 1
                     self.global_step += 1
-
                     self.before_step(feed_dict)
-                    output_dict = self._run_step(feed_dict)
+                    output_dict = self.run_step(feed_dict)
                     self.after_step(output_dict)
-
                     self.trigger_step()
 
-                self._after_epoch()
-                logger.info(f'Epoch finished in {humanize.naturaldelta(time.perf_counter() - epoch_time)}')
-
+                self.after_epoch()
+                logger.info('Training finished in {}.'.format(humanize.naturaldelta(time.perf_counter() - epoch_time)))
                 self.trigger_epoch()
+                logger.info('Epoch finished in {}.'.format(humanize.naturaldelta(time.perf_counter() - epoch_time)))
 
             logger.success(f'{self.num_epochs} epochs of training finished in {humanize.naturaldelta(time.perf_counter() - train_time)}')
-
         except StopTraining as e:
             logger.info(f'Training was stopped by {str(e)}.')
         finally:

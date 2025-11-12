@@ -86,8 +86,6 @@ def main() -> None:
         num_workers=configs.workers_per_gpu,
         seed=seed,
         amp_enabled=configs.amp_enabled,
-        lambda_bawa = configs.model.lambda_bawa,
-        lambda_mask = configs.model.lambda_mask,
     )
 
     trainer.train_with_defaults(
