@@ -29,6 +29,14 @@ def get_raw_kitti(phase):
                             voxel_size=dataset_config.voxel_size)
     return dataset[phase]
 
+def get_learner(phase):
+    from core.datasets import SemanticLearnerKITTI
+    dataset_config = configs.src_dataset if phase == 'train' else configs.tgt_dataset
+    dataset = SemanticLearnerKITTI(root=dataset_config.root,
+                            num_points=dataset_config.num_points,
+                            voxel_size=dataset_config.voxel_size)
+    return dataset[phase]
+
 def get_aug_kitti(phase):
     from core.datasets import AugSemanticKITTI
     dataset_config = configs.src_dataset if phase == 'train' else configs.tgt_dataset
@@ -84,6 +92,8 @@ def make_dataset() -> Dataset:
         src_dataset = get_aug_single_kitti(phase='train')
     elif configs.src_dataset.name == 'semanticstf':
         src_dataset = get_stf(phase='train')
+    elif configs.src_dataset.name == 'semantic_learner':
+        src_dataset = get_learner(phase='train')
     else:
         raise NotImplementedError(configs.dataset.name)
 
@@ -129,7 +139,7 @@ def make_model() -> nn.Module:
             cr = configs.model.cr
         else:
             cr = 1.0
-        model = MinkUNet_Learner(num_classes=configs.data.num_classes, cr=cr, ljm_config=configs.model.ljm, adm_config=configs.model.adm,)
+        model = MinkUNet_Learner(num_classes=configs.data.num_classes, cr=cr, )
     else:
         raise NotImplementedError(configs.model.name)
     return model

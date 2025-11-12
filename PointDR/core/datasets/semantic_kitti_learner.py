@@ -1,7 +1,6 @@
 import os
 
 import numpy as np
-import torch
 from torchsparse import SparseTensor
 from torchsparse.utils.collate import sparse_collate_fn
 from torchsparse.utils.quantize import sparse_quantize
@@ -60,7 +59,7 @@ class SemanticLearnerKITTI(dict):
         sample_stride = kwargs.get('sample_stride', 1)
         google_mode = kwargs.get('google_mode', False)
 
-        logger.info("SKT Learner")
+        logger.info("SemanticKITTI  Learner")
 
         if submit_to_server:
             super().__init__({
@@ -175,93 +174,155 @@ class SemanticLearnerKITTIInternal:
         return len(self.files)
 
     def __getitem__(self, index):
-        with open(self.files[index], 'rb') as b:
-            block_ = np.fromfile(b, dtype=np.float32).reshape(-1, 4)
-        # read labels
-        pc_ = np.round(block_[:, :3] / self.voxel_size).astype(np.int32)
-        pc_ -= pc_.min(0, keepdims=1)
+        # 1. 读取原始点云和标签
+        with open(self.files[index], 'rb') as f:
+            block_ = np.fromfile(f, dtype=np.float32).reshape(-1, 4)
 
+        orig_indices = np.arange(block_.shape[0])
+
+        # 标签处理
         label_file = self.files[index].replace('velodyne', 'labels').replace('.bin', '.label')
         if os.path.exists(label_file):
-            with open(label_file, 'rb') as a:
-                all_labels = np.fromfile(a, dtype=np.int32).reshape(-1)
+            with open(label_file, 'rb') as f:
+                all_labels = np.fromfile(f, dtype=np.int32).reshape(-1)
         else:
-            all_labels = np.zeros(pc_.shape[0]).astype(np.int32)
+            all_labels = np.zeros(block_.shape[0], dtype=np.int32)
+        labels_ = self.label_map[all_labels & 0xFFFF].astype(np.int64)
 
-        labels_raw = self.label_map[all_labels & 0xFFFF].astype(np.int64)
+        # 转换到体素坐标 (尚未去重)
+        pc_original = np.round(block_[:, :3] / self.voxel_size).astype(np.int32)
 
-        coords_float = block_[:, :3].copy()
+        # 2. 随机采样点 (点级别降采样)
+        if 'train' in self.split and len(block_) > self.num_points:
+            idxes = np.random.choice(len(block_), self.num_points, replace=False)
 
-        feats_float = block_.copy()
-        labels_raw_float = labels_raw.copy()
+            pc_original = pc_original[idxes]
+            block_ = block_[idxes]
+            labels_ = labels_[idxes]
+            orig_indices = orig_indices[idxes]
 
-        pc_quantized = np.round(coords_float / self.voxel_size).astype(np.int32)
-        pc_quantized -= pc_quantized.min(0, keepdims=1)  # 最小平移
+        # 归一化体素坐标
+        pc_original -= pc_original.min(0, keepdims=1)
 
-        pc, inds, inverse_map = sparse_quantize(pc_quantized, return_index=True, return_inverse=True)
+        _, inds_clean, _ = sparse_quantize(
+            pc_original,
+            return_index=True,
+            return_inverse=True
+        )
 
+        ratio_clean = np.random.random() * 0.2 + 0.8
+        if 'train' in self.split and len(inds_clean) > int(self.num_points * ratio_clean):
+            # inds_clean 是体素索引，对其进行二次采样
+            inds_clean = np.random.choice(inds_clean,
+                                          int(self.num_points * ratio_clean),
+                                          replace=False)
+
+        inverse_map_clean_F = orig_indices[inds_clean]
+
+        pc_voxel_clean = pc_original[inds_clean]
+        feat_voxel_clean = block_[inds_clean]
+
+        lidar_clean = SparseTensor(feat_voxel_clean, pc_voxel_clean)
+        # 逆映射 F 字段长度现在等于 pc_voxel_clean 的长度 (N_voxel)
+        inverse_map_clean_st = SparseTensor(inverse_map_clean_F[:, np.newaxis], pc_voxel_clean)
+
+        # 4. 数据增强 (在采样的 block_ 上进行)
+        block_aug = block_.copy()
+        labels_aug = labels_.copy()
+        orig_indices_aug = orig_indices.copy()
+
+        # a. 随机 dropout
+        if 'train' in self.split and np.random.rand() < 0.5:
+            keep_ratio = np.random.uniform(0.8, 1.0)
+            keep_idx = np.random.choice(np.arange(block_aug.shape[0]),
+                                        int(block_aug.shape[0] * keep_ratio),
+                                        replace=False)
+            block_aug = block_aug[keep_idx]
+            labels_aug = labels_aug[keep_idx]
+            orig_indices_aug = orig_indices_aug[keep_idx]
+
+            # b. 加噪声
+        if 'train' in self.split and np.random.rand() < 0.5:
+            xmin, xmax = block_aug[:, 0].min(), block_aug[:, 0].max()
+            ymin, ymax = block_aug[:, 1].min(), block_aug[:, 1].max()
+            zmin, zmax = block_aug[:, 2].min(), block_aug[:, 2].max()
+            imin, imax = block_aug[:, 3].min(), block_aug[:, 3].max()
+            noise_num = int(np.random.rand() * 2000)
+            noise = np.stack([
+                np.random.uniform(xmin, xmax, noise_num),
+                np.random.uniform(ymin, ymax, noise_num),
+                np.random.uniform(zmin, zmax, noise_num),
+                np.random.normal((imin + imax) / 2, 0.5, noise_num)
+            ], axis=1).astype(np.float32)
+            noise_labels = np.ones(noise.shape[0], dtype=np.int64) * 255
+
+            # 噪声点没有原始点索引，用 -1 占位
+            noise_indices = np.ones(noise.shape[0], dtype=orig_indices_aug.dtype) * -1
+            orig_indices_aug = np.concatenate([orig_indices_aug, noise_indices], axis=0)
+
+            block_aug = np.concatenate([block_aug, noise], axis=0)
+            labels_aug = np.concatenate([labels_aug, noise_labels], axis=0)
+
+        # c. rotate + scale
         if 'train' in self.split:
-            if len(inds) > self.num_points:
-                inds = np.random.choice(inds, self.num_points, replace=False)
+            theta = np.random.uniform(0, 2 * np.pi)
+            scale = np.random.uniform(0.95, 1.05)
+            rot_mat = np.array([[np.cos(theta), np.sin(theta), 0],
+                                [-np.sin(theta), np.cos(theta), 0],
+                                [0, 0, 1]])
+            block_aug[:, :3] = block_aug[:, :3].dot(rot_mat.T) * scale
 
-        pc_sampled = pc_quantized[inds]
-        feat_sampled = feats_float[inds]
-        labels_sampled = labels_raw_float[inds]
+        # d. flip X/Y
+        if 'train' in self.split and np.random.rand() < 0.5:
+            block_aug[:, 0] *= -1
+        if 'train' in self.split and np.random.rand() < 0.5:
+            block_aug[:, 1] *= -1
 
-        lidar = SparseTensor(feat_sampled, pc_sampled)
-        labels = SparseTensor(labels_sampled, pc_sampled)
+        # e. jitter
+        if 'train' in self.split and np.random.rand() < 0.5:
+            jitter = np.random.normal(0, 0.01, (block_aug.shape[0], 3))
+            block_aug[:, :3] += np.clip(jitter, -0.05, 0.05)
 
-        labels_full_quantized = labels_raw_float[inverse_map]
-        labels_full_quantized[inverse_map] = labels_raw_float
-        labels_ = SparseTensor(labels_full_quantized, pc_quantized)
+        # 5. voxelization & sparse tensor (Augmented Data)
+        pc_aug = np.round(block_aug[:, :3] / self.voxel_size).astype(np.int32)
+        pc_aug -= pc_aug.min(0, keepdims=1)  # 归一化体素坐标
 
-        inverse_map = SparseTensor(inverse_map, pc_quantized)
+        _, inds_aug, _ = sparse_quantize(
+            pc_aug,
+            return_index=True,
+            return_inverse=True
+        )
+
+        ratio_aug = np.random.random() * 0.2 + 0.8
+        if 'train' in self.split and len(inds_aug) > int(self.num_points * ratio_aug):
+            inds_aug = np.random.choice(inds_aug,
+                                        int(self.num_points * ratio_aug),
+                                        replace=False)
+
+        inverse_map_aug_F = orig_indices_aug[inds_aug]
+
+        pc_voxel_aug = pc_aug[inds_aug]
+        feat_voxel_aug = block_aug[inds_aug]
+        labels_voxel_aug = labels_aug[inds_aug]
+
+        lidar_aug = SparseTensor(feat_voxel_aug, pc_voxel_aug)
+        labels_aug_st = SparseTensor(labels_voxel_aug, pc_voxel_aug)
+
+        # 逆映射 F 字段的长度现在等于 pc_voxel_aug 的长度 (N_voxel)
+        inverse_map_aug_st = SparseTensor(inverse_map_aug_F[:, np.newaxis], pc_voxel_aug)
+
+        # targets_mapped (使用所有点)
+        targets_mapped = SparseTensor(labels_aug, pc_aug)
 
         return {
-            'lidar': lidar,
-            'targets': labels,
-            'targets_mapped': labels_,
-            'inverse_map': inverse_map,
-
-            'raw_coords': feats_float[:, :3].copy(),
-            'raw_feats': feats_float.copy(),
-            'raw_labels': labels_raw_float.copy(),
-
+            'lidar': lidar_aug,
+            'targets': labels_aug_st,
+            'targets_mapped': targets_mapped,
+            'bawa_clean': lidar_clean,
+            'inverse_map': inverse_map_aug_st,
+            'inverse_map_clean': inverse_map_clean_st,
             'file_name': self.files[index]
         }
-
-
     @staticmethod
     def collate_fn(inputs):
-        """
-                批处理函数，需处理新增的原始浮点数据。
-                """
-        # 提取 SparseTensor 列表
-        sparse_inputs = []
-        for key in ['lidar', 'targets', 'targets_mapped', 'inverse_map']:
-            sparse_inputs.append([data[key] for data in inputs])
-
-        # 提取原始浮点数据和文件名
-        raw_coords = [data['raw_coords'] for data in inputs]
-        raw_feats = [data['raw_feats'] for data in inputs]
-        raw_labels = [data['raw_labels'] for data in inputs]
-        file_names = [data['file_name'] for data in inputs]
-
-        # 使用 TorchSparse 的 collate_fn 批处理 SparseTensor
-        sparse_collated = sparse_collate_fn(sparse_inputs)
-
-        # 构造最终的输出字典
-        output_dict = {
-            'lidar': sparse_collated[0],
-            'targets': sparse_collated[1],
-            'targets_mapped': sparse_collated[2],
-            'inverse_map': sparse_collated[3],
-
-            'raw_coords': [torch.from_numpy(c).float() for c in raw_coords],
-            'raw_feats': [torch.from_numpy(f).float() for f in raw_feats],
-            'raw_labels': [torch.from_numpy(l).long() for l in raw_labels],
-
-            'file_name': file_names
-        }
-
-        return output_dict
+        return sparse_collate_fn(inputs)

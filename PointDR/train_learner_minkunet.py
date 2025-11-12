@@ -72,28 +72,11 @@ def main() -> None:
                                                       pin_memory=True,
                                                       collate_fn=dataset[split].collate_fn)
 
+
     model = builder.make_model().cuda()
     criterion = builder.make_criterion()
-
-
-    # 1. 筛选主干网络参数
-    seg_params = [
-        p for name, p in model.named_parameters()
-        if 'ljm' not in name and 'adm' not in name and p.requires_grad
-    ]
-    # 2. 构建主优化器 (分割网络)
-    optimizer = builder.make_parms_optimizer(params=seg_params, config=configs.optimizer)
-    scheduler = builder.make_scheduler(optimizer)  # Scheduler 绑定主优化器
-
-    optimizer_ljm = None
-    if hasattr(configs, 'optimizer_ljm') and hasattr(model, 'ljm'):
-        optimizer_ljm = builder.make_parms_optimizer(params=model.ljm.parameters(), config=configs.optimizer_ljm)
-        logger.info('LJM Optimizer built successfully.')
-
-    optimizer_adm = None
-    if hasattr(configs, 'optimizer_adm') and hasattr(model, 'adm'):
-        optimizer_adm = builder.make_parms_optimizer(params=model.adm.parameters(), config=configs.optimizer_adm)
-        logger.info('ADM Optimizer built successfully.')
+    optimizer = builder.make_optimizer(model)
+    scheduler = builder.make_scheduler(optimizer)
 
     trainer = MinkUnetLearnerTrainer(
         model=model,
@@ -103,9 +86,8 @@ def main() -> None:
         num_workers=configs.workers_per_gpu,
         seed=seed,
         amp_enabled=configs.amp_enabled,
-        # 传入 LJM 和 ADM 优化器
-        optimizer_ljm=optimizer_ljm,
-        optimizer_adm=optimizer_adm,
+        lambda_bawa = configs.model.lambda_bawa,
+        lambda_mask = configs.model.lambda_mask,
     )
 
     trainer.train_with_defaults(
