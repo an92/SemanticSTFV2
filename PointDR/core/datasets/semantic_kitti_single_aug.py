@@ -9,51 +9,11 @@ from torchpack.utils.logging import logger
 
 __all__ = ['SingleAugSemanticKITTI']
 
+from PointDR.core.datasets.settings import kept_labels, label_name_mapping
 from PointDR.core.datasets.transform_3d import apply_rotate_scale, \
     apply_random_jittering, apply_random_drop_out, apply_add_noise_points, \
-    apply_flip_axis,apply_intensity_channel_distortion, apply_physical_attenuation_model, apply_selective_range_jittering
-
-label_name_mapping = {
-    0: 'unlabeled',
-    1: 'outlier',
-    10: 'car',
-    11: 'bicycle',
-    13: 'bus',
-    15: 'motorcycle',
-    16: 'on-rails',
-    18: 'truck',
-    20: 'other-vehicle',
-    30: 'person',
-    31: 'bicyclist',
-    32: 'motorcyclist',
-    40: 'road',
-    44: 'parking',
-    48: 'sidewalk',
-    49: 'other-ground',
-    50: 'building',
-    51: 'fence',
-    52: 'other-structure',
-    60: 'lane-marking',
-    70: 'vegetation',
-    71: 'trunk',
-    72: 'terrain',
-    80: 'pole',
-    81: 'traffic-sign',
-    99: 'other-object',
-    252: 'moving-car',
-    253: 'moving-bicyclist',
-    254: 'moving-person',
-    255: 'moving-motorcyclist',
-    256: 'moving-on-rails',
-    257: 'moving-bus',
-    258: 'moving-truck',
-    259: 'moving-other-vehicle'
-}
-
-kept_labels = [
-    'road', 'sidewalk', 'parking', 'other-ground', 'building', 'car', 'truck', 'bicycle', 'motorcycle', 'other-vehicle', 'vegetation', 'trunk', 'terrain', 'person', 'bicyclist', 'motorcyclist',
-    'fence', 'pole', 'traffic-sign'
-]
+    apply_flip_axis, apply_intensity_channel_distortion, apply_physical_attenuation_model, \
+    apply_selective_range_jittering, apply_weather_layered_augmentation
 
 AUG_MAP = {
     'rotate_scale': apply_rotate_scale,
@@ -64,8 +24,8 @@ AUG_MAP = {
     'intensity_channel_distortion': apply_intensity_channel_distortion,
     'physical_attenuation_model': apply_physical_attenuation_model,
     'selective_range_jittering': apply_selective_range_jittering,
+    'weather_layered_augmentation': apply_weather_layered_augmentation
 }
-
 
 class AugmentationPipeline:
 

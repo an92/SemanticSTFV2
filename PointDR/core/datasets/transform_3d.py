@@ -215,3 +215,128 @@ def apply_intensity_channel_distortion(block: np.ndarray, labels: np.ndarray, id
     block[:, 3] = intensity
 
     return block, labels, ids
+
+
+things_class_ids = [0, 1, 2, 3, 4, 5, 6, 7, 13, 17, 18]
+
+import numpy as np
+from typing import Dict, Any, Tuple
+
+things_class_ids = [0, 1, 2, 3, 4, 5, 6, 7, 13, 17, 18]
+
+def apply_weather_layered_augmentation(block: np.ndarray, labels: np.ndarray, ids: np.ndarray, config: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    天气分层增强：
+    - 雪、雨、雾、薄雾
+    - 每种天气按概率执行
+    - 对小目标 (things_class_ids) 使用高概率扰动
+    - 对大结构 (stuff) 使用低概率轻微扰动
+    """
+    cfg = config.get('weather_layered_augmentation', {})
+    if np.random.rand() >= cfg.get('prob', 1.0) or block.shape[0] == 0:
+        return block, labels, ids
+
+    weather_cfg = cfg.get('weather_prob', {
+        'snow': 0.3,
+        'rain': 0.3,
+        'fog': 0.2,
+        'thin_fog': 0.2
+    })
+
+    coords = block[:, :3].copy()
+    feats = block[:, 3:].copy() if block.shape[1] > 3 else None
+
+    # ------------------------
+    # 遍历天气类型
+    # ------------------------
+    for weather, p in weather_cfg.items():
+        if np.random.rand() >= p:
+            continue  # 不触发该天气增强
+
+        # ------------------------
+        # 1. 点丢失增强
+        # ------------------------
+        drop_prob_small = cfg.get('drop_prob_small', 0.3)
+        drop_prob_large = cfg.get('drop_prob_large', 0.05)
+
+        # 保证 mask 与当前 labels 对齐
+        num_points = labels.shape[0]
+        small_mask = np.isin(labels, things_class_ids)
+        large_mask = ~small_mask
+        keep_prob = np.ones(num_points)
+        keep_prob[small_mask] *= 1 - drop_prob_small
+        keep_prob[large_mask] *= 1 - drop_prob_large
+        keep_mask = np.random.rand(num_points) < keep_prob
+
+        coords = coords[keep_mask]
+        labels = labels[keep_mask]
+        ids = ids[keep_mask]
+        if feats is not None:
+            feats = feats[keep_mask]
+
+        # ------------------------
+        # 2. 局部簇扰动
+        # ------------------------
+        cluster_size = cfg.get('cluster_size', 10)
+        sigma_local = cfg.get('sigma_local', 0.02)
+        num_clusters = cfg.get('num_clusters', 5)
+
+        num_points = labels.shape[0]
+        for _ in range(num_clusters):
+            if num_points == 0:
+                break
+            center_idx = np.random.randint(0, num_points)
+            dists = np.linalg.norm(coords - coords[center_idx], axis=1)
+            cluster_mask = np.argsort(dists)[:cluster_size]
+
+            keep_mask_cluster = np.ones(num_points, dtype=bool)
+            keep_mask_cluster[cluster_mask] = False
+
+            coords = coords[keep_mask_cluster]
+            labels = labels[keep_mask_cluster]
+            ids = ids[keep_mask_cluster]
+            if feats is not None:
+                feats = feats[keep_mask_cluster]
+
+            num_points = labels.shape[0]
+
+        # 局部微扰
+        if num_points > 0:
+            coords += np.random.normal(0, sigma_local, coords.shape)
+
+        # ------------------------
+        # 3. 深度漂移（浓雾/薄雾）
+        # ------------------------
+        if weather in ['fog', 'thin_fog'] and num_points > 0:
+            base_sigma = cfg.get('depth_sigma', 0.02)
+            distances = np.linalg.norm(coords, axis=1)
+            max_dist = distances.max() + 1e-6
+            coords[:, 2] += np.random.normal(0, base_sigma * distances / max_dist, size=num_points)
+
+        # ------------------------
+        # 4. 随机孤立点增强（雪/雨）
+        # ------------------------
+        if weather in ['snow', 'rain'] and num_points > 0:
+            noise_ratio = cfg.get('noise_ratio', 0.005)
+            num_noise = int(coords.shape[0] * noise_ratio)
+            if num_noise > 0:
+                xyz_min = coords.min(0)
+                xyz_max = coords.max(0)
+                noise_xyz = np.random.uniform(xyz_min, xyz_max, size=(num_noise, 3))
+                coords = np.concatenate([coords, noise_xyz], axis=0)
+                labels = np.concatenate([labels, np.full(num_noise, 255)], axis=0)
+                ids = np.concatenate([ids, np.arange(ids.max()+1, ids.max()+1+num_noise)], axis=0)
+                if feats is not None:
+                    feats = np.concatenate([feats, np.zeros((num_noise, feats.shape[1]), dtype=feats.dtype)], axis=0)
+
+    # ------------------------
+    # 5. 构造新的 block 返回
+    # ------------------------
+    if feats is not None:
+        block_new = np.hstack([coords, feats])
+    else:
+        block_new = coords
+
+    block_new = block_new.astype(np.float32)
+
+    return block_new, labels, ids
