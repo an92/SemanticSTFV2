@@ -8,53 +8,46 @@ from torchpack.utils.typing import Dataset, Optimizer, Scheduler
 
 import pdb
 
-__all__ = [
-    'make_dataset', 'make_model', 'make_criterion', 'make_optimizer', 'make_scheduler'
-]
+__all__ = ['make_dataset', 'make_model', 'make_criterion', 'make_optimizer', 'make_scheduler']
 
 
 def get_kitti(phase):
     from core.datasets import SemanticKITTI
     dataset_config = configs.src_dataset if phase == 'train' else configs.tgt_dataset
-    dataset = SemanticKITTI(root=dataset_config.root,
-                            num_points=dataset_config.num_points,
-                            voxel_size=dataset_config.voxel_size)
+    dataset = SemanticKITTI(root=dataset_config.root, num_points=dataset_config.num_points, voxel_size=dataset_config.voxel_size)
     return dataset[phase]
+
 
 def get_raw_kitti(phase):
     from core.datasets import SemanticRawKITTI
     dataset_config = configs.src_dataset if phase == 'train' else configs.tgt_dataset
-    dataset = SemanticRawKITTI(root=dataset_config.root,
-                            num_points=dataset_config.num_points,
-                            voxel_size=dataset_config.voxel_size)
+    dataset = SemanticRawKITTI(root=dataset_config.root, num_points=dataset_config.num_points, voxel_size=dataset_config.voxel_size)
     return dataset[phase]
+
 
 def get_learner(phase):
     from core.datasets import SemanticLearnerKITTI
     dataset_config = configs.src_dataset if phase == 'train' else configs.tgt_dataset
-    dataset = SemanticLearnerKITTI(root=dataset_config.root,
-                            num_points=dataset_config.num_points,
-                            voxel_size=dataset_config.voxel_size)
+    dataset = SemanticLearnerKITTI(root=dataset_config.root, num_points=dataset_config.num_points, voxel_size=dataset_config.voxel_size)
     return dataset[phase]
+
 
 def get_aug_kitti(phase):
     from core.datasets import AugSemanticKITTI
     dataset_config = configs.src_dataset if phase == 'train' else configs.tgt_dataset
     dataset = AugSemanticKITTI(root=dataset_config.root,
-                            num_points=dataset_config.num_points,
-                            voxel_size=dataset_config.voxel_size,
-                            weak_aug=dataset_config.get('weak_aug'),
-                            strong_aug = dataset_config.get('strong_aug'))
+                               num_points=dataset_config.num_points,
+                               voxel_size=dataset_config.voxel_size,
+                               weak_aug=dataset_config.get('weak_aug'),
+                               strong_aug=dataset_config.get('strong_aug'))
 
     return dataset[phase]
+
 
 def get_aug_single_kitti(phase):
     from core.datasets import SingleAugSemanticKITTI
     dataset_config = configs.src_dataset if phase == 'train' else configs.tgt_dataset
-    dataset = SingleAugSemanticKITTI(root=dataset_config.root,
-                            num_points=dataset_config.num_points,
-                            voxel_size=dataset_config.voxel_size,
-                            strong_aug = dataset_config.get('strong_aug'))
+    dataset = SingleAugSemanticKITTI(root=dataset_config.root, num_points=dataset_config.num_points, voxel_size=dataset_config.voxel_size, strong_aug=dataset_config.get('strong_aug'))
 
     return dataset[phase]
 
@@ -62,19 +55,14 @@ def get_aug_single_kitti(phase):
 def get_synlidar():
     from core.datasets import SynLiDAR
     dataset_config = configs.src_dataset
-    dataset = SynLiDAR(root=configs.src_dataset.root,
-                       num_points=configs.src_dataset.num_points,
-                       voxel_size=configs.src_dataset.voxel_size,
-                       src=configs.tgt_dataset.name)
+    dataset = SynLiDAR(root=configs.src_dataset.root, num_points=configs.src_dataset.num_points, voxel_size=configs.src_dataset.voxel_size, src=configs.tgt_dataset.name)
     return dataset['train']
 
 
 def get_stf(phase='test'):
     from core.datasets import SemanticSTF
     dataset_config = configs.src_dataset if phase == 'train' else configs.tgt_dataset
-    dataset = SemanticSTF(root=dataset_config.root,
-                          num_points=dataset_config.num_points,
-                          voxel_size=dataset_config.voxel_size)
+    dataset = SemanticSTF(root=dataset_config.root, num_points=dataset_config.num_points, voxel_size=dataset_config.voxel_size)
     return dataset[phase]
 
 
@@ -139,7 +127,12 @@ def make_model() -> nn.Module:
             cr = configs.model.cr
         else:
             cr = 1.0
-        model = MinkUNet_Learner(num_classes=configs.data.num_classes, cr=cr, )
+        model = MinkUNet_Learner(
+            num_classes=configs.data.num_classes,
+            cr=cr,
+            gamma_acp=configs.model.gamma_acp,
+            r_median=configs.model.r_median,
+        )
     else:
         raise NotImplementedError(configs.model.name)
     return model
@@ -155,21 +148,11 @@ def make_criterion() -> Callable:
 
 def make_optimizer(model: nn.Module) -> Optimizer:
     if configs.optimizer.name == 'sgd':
-        optimizer = torch.optim.SGD(model.parameters(),
-                                    lr=configs.optimizer.lr,
-                                    momentum=configs.optimizer.momentum,
-                                    weight_decay=configs.optimizer.weight_decay,
-                                    nesterov=configs.optimizer.nesterov)
+        optimizer = torch.optim.SGD(model.parameters(), lr=configs.optimizer.lr, momentum=configs.optimizer.momentum, weight_decay=configs.optimizer.weight_decay, nesterov=configs.optimizer.nesterov)
     elif configs.optimizer.name == 'adam':
-        optimizer = torch.optim.Adam(
-            model.parameters(),
-            lr=configs.optimizer.lr,
-            weight_decay=configs.optimizer.weight_decay)
+        optimizer = torch.optim.Adam(model.parameters(), lr=configs.optimizer.lr, weight_decay=configs.optimizer.weight_decay)
     elif configs.optimizer.name == 'adamw':
-        optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=configs.optimizer.lr,
-            weight_decay=configs.optimizer.weight_decay)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=configs.optimizer.lr, weight_decay=configs.optimizer.weight_decay)
     else:
         raise NotImplementedError(configs.optimizer.name)
     return optimizer
@@ -177,42 +160,41 @@ def make_optimizer(model: nn.Module) -> Optimizer:
 
 def make_parms_optimizer(params, config) -> Optimizer:
     if config.name == 'sgd':
-        optimizer = torch.optim.SGD(params, # 传入分离后的参数列表
-                                    lr=config.lr,
-                                    momentum=config.momentum,
-                                    weight_decay=config.weight_decay,
-                                    nesterov=config.nesterov)
+        optimizer = torch.optim.SGD(
+            params,    # 传入分离后的参数列表
+            lr=config.lr,
+            momentum=config.momentum,
+            weight_decay=config.weight_decay,
+            nesterov=config.nesterov)
     elif config.name == 'adam':
         optimizer = torch.optim.Adam(
-            params, # 传入分离后的参数列表
+            params,    # 传入分离后的参数列表
             lr=config.lr,
             weight_decay=config.weight_decay)
     elif config.name == 'adamw':
         optimizer = torch.optim.AdamW(
-            params, # 传入分离后的参数列表
+            params,    # 传入分离后的参数列表
             lr=config.lr,
             weight_decay=config.weight_decay)
     else:
         raise NotImplementedError(config.name)
     return optimizer
 
+
 def make_scheduler(optimizer: Optimizer) -> Scheduler:
     if configs.scheduler.name == 'none':
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer,
-                                                      lr_lambda=lambda epoch: 1)
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda epoch: 1)
     elif configs.scheduler.name == 'cosine':
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=configs.num_epochs)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=configs.num_epochs)
     elif configs.scheduler.name == 'cosine_warmup':
         from functools import partial
 
         from core.schedulers import cosine_schedule_with_warmup
-        scheduler = torch.optim.lr_scheduler.LambdaLR(
-            optimizer,
-            lr_lambda=partial(cosine_schedule_with_warmup,
-                              num_epochs=configs.num_epochs,
-                              batch_size=configs.batch_size,
-                              dataset_size=configs.data.training_size))
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer,
+                                                      lr_lambda=partial(cosine_schedule_with_warmup,
+                                                                        num_epochs=configs.num_epochs,
+                                                                        batch_size=configs.batch_size,
+                                                                        dataset_size=configs.data.training_size))
     else:
         raise NotImplementedError(configs.scheduler.name)
     return scheduler

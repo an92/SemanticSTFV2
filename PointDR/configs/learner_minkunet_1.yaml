@@ -1,11 +1,13 @@
 model:
   name: minkunet_learner
   cr: 0.5
-  alpha_grl: 0.15
-  lambda_adv: 1.5    # L_adv-D 权重
-  lambda_R: 0.05
-  lambda_SCD: 1.2   # L_Proto 权重
-  warmup_epochs: 5  # 原型 Warm-up 阶段
+  lamda_ct: 0.15
+  lamda_sc: 0.1
+  lamda_snc: 0.1
+  k_snc: 8
+  gamma_acp: 12
+  r_median: 0.0  # 自动计算
+
 
 data:
   num_classes: 19
@@ -17,16 +19,10 @@ train:
   deterministic: False
 
 src_dataset:
-  name: semantic_learner
+  name: semantickitti   # pointdr原始的数据处理方式
   root: /home/dataset/SemanticKITTI/sequences
   num_points: 80000
   voxel_size: 0.05
-
-#tgt_dataset:
-#  name: semantickitti    # kitti数据进行测试
-#  root: /home/dataset/SemanticKITTI/sequences
-#  num_points: 80000
-#  voxel_size: 0.05
 
 tgt_dataset:
   name: semanticstf
@@ -53,5 +49,5 @@ scheduler:
 
 
 workers_per_gpu: 8
-distributed: False
+distributed: True
 amp_enabled: True

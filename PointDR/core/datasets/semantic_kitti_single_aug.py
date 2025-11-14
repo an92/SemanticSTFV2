@@ -13,7 +13,10 @@ from PointDR.core.datasets.settings import kept_labels, label_name_mapping
 from PointDR.core.datasets.transform_3d import apply_rotate_scale, \
     apply_random_jittering, apply_random_drop_out, apply_add_noise_points, \
     apply_flip_axis, apply_intensity_channel_distortion, apply_physical_attenuation_model, \
-    apply_selective_range_jittering, apply_weather_layered_augmentation
+    apply_selective_range_jittering, apply_weather_layered_augmentation, apply_geometry_selective_jitter, \
+    apply_distance_biased_point_drop, apply_intensity_jitter,  apply_occlusion_patch
+
+
 
 AUG_MAP = {
     'rotate_scale': apply_rotate_scale,
@@ -24,8 +27,13 @@ AUG_MAP = {
     'intensity_channel_distortion': apply_intensity_channel_distortion,
     'physical_attenuation_model': apply_physical_attenuation_model,
     'selective_range_jittering': apply_selective_range_jittering,
-    'weather_layered_augmentation': apply_weather_layered_augmentation
+    'weather_layered_augmentation': apply_weather_layered_augmentation,
+    'geometry_selective_jitter': apply_geometry_selective_jitter,
+    'distance_biased_point_drop': apply_distance_biased_point_drop,
+    'intensity_jitter': apply_intensity_jitter,
+    'occlusion_patch': apply_occlusion_patch,
 }
+
 
 class AugmentationPipeline:
 
@@ -177,7 +185,13 @@ class SingleAugSemanticKITTIInternal:
         labels_ = SparseTensor(labels_, pc_)
         inverse_map = SparseTensor(inverse_map, pc_)
 
-        return {'lidar': lidar, 'targets': labels, 'targets_mapped': labels_, 'inverse_map': inverse_map, 'file_name': self.files[index]}
+        return {
+            'lidar': lidar,
+            'targets': labels,
+            'targets_mapped': labels_,
+            'inverse_map': inverse_map,
+            'file_name': self.files[index],
+        }
 
     def __getitem__(self, index):
         return self.return_aug_single_views(index)

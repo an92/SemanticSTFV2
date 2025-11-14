@@ -340,3 +340,245 @@ def apply_weather_layered_augmentation(block: np.ndarray, labels: np.ndarray, id
     block_new = block_new.astype(np.float32)
 
     return block_new, labels, ids
+
+
+
+# ---------------------------------------------------------------------
+# Helper utilities (used by both augmentations)
+# ---------------------------------------------------------------------
+def _voxelize_coords(coords: np.ndarray, voxel_size: float):
+    """
+    Returns integer voxel indices for coords (N,3).
+    """
+    return np.floor(coords / voxel_size).astype(np.int32)
+
+def _compute_voxel_occupancies(coords: np.ndarray, voxel_size: float):
+    """
+    Return a dict mapping voxel tuple -> indices list and per-point voxel-id index.
+    """
+    v = _voxelize_coords(coords, voxel_size)
+    # create single integer key per voxel for dictionary hashing
+    keys = [f"{a}_{b}_{c}" for a, b, c in v]
+    voxel2idx = {}
+    point_voxel_key = np.empty(len(keys), dtype=object)
+    for i, k in enumerate(keys):
+        point_voxel_key[i] = k
+        if k not in voxel2idx:
+            voxel2idx[k] = []
+        voxel2idx[k].append(i)
+    return voxel2idx, point_voxel_key
+
+# ---------------------------------------------------------------------
+# 1) Geometry-consistent Selective Jitter (GSJ)
+# ---------------------------------------------------------------------
+def apply_geometry_selective_jitter(block: np.ndarray, labels: np.ndarray, ids: np.ndarray, config: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Geometry-aware selective jitter.
+    block: (N, >=3) float32 with at least xyz in [:,0:3] and optionally intensity at [:,3].
+    labels, ids: 1D arrays aligned with block rows.
+    config: top-level config dict; this function expects config['geometry_selective_jitter'] to contain parameters.
+
+    Returns modified (block, labels, ids).
+    """
+    cfg = config.get('geometry_selective_jitter', {})
+    p_frame = cfg.get('prob', 0.5)                # frame-level apply prob
+    jitter_prob = cfg.get('jitter_prob', 0.25)   # per-point candidate prob
+    base_std = cfg.get('base_std', 0.008)        # meters
+    dist_factor = cfg.get('dist_factor', 0.0006)
+    cluster_voxel = cfg.get('cluster_voxel_size', 2.0)  # meters, coarse clustering resolution
+    cluster_min_points = cfg.get('cluster_min_points', 20)
+    min_sf = cfg.get('min_scaling', 0.95)
+    max_sf = cfg.get('max_scaling', 1.05)
+    normal_k = cfg.get('normal_k', 12)           # neigh count for local plane estimation (per-voxel)
+    rng = np.random
+
+    if block is None or block.shape[0] == 0:
+        return block, labels, ids
+
+    if rng.rand() > p_frame:
+        return block, labels, ids
+
+    coords = block[:, :3].astype(np.float32)
+    N = coords.shape[0]
+
+    # --- 1) build coarse voxels to do local PCA (approx normals) and clustering ---
+    # Use coarse voxelization to group nearby points; this avoids O(N^2) kNN
+    voxel2idx, point_voxel_key = _compute_voxel_occupancies(coords, voxel_size=cluster_voxel)
+
+    # compute per-voxel normals by PCA of points in voxel
+    normals = np.zeros((N, 3), dtype=np.float32)
+    for key, idx_list in voxel2idx.items():
+        idxs = np.array(idx_list, dtype=np.int32)
+        if idxs.size < 3:
+            normals[idxs] = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+            continue
+        pts = coords[idxs]
+        # PCA (covariance), smallest eigenvector is normal
+        centroid = pts.mean(axis=0)
+        cov = (pts - centroid).T @ (pts - centroid)
+        try:
+            _, s, vt = np.linalg.svd(cov)
+            normal = vt[-1]
+            # fix NaN or zero normal
+            if not np.all(np.isfinite(normal)):
+                normal = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+            normals[idxs] = normal.astype(np.float32)
+        except Exception:
+            normals[idxs] = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+
+    # --- 2) select candidate points to jitter ---
+    select_mask = (rng.rand(N) < jitter_prob)
+    if select_mask.sum() == 0:
+        return block, labels, ids
+
+    # --- 3) cluster selected points by coarse voxel again (reuse voxel keys) ---
+    # Build mapping from voxel key to indices among selected points
+    sel_idxs = np.where(select_mask)[0]
+    sel_voxel_keys = [point_voxel_key[i] for i in sel_idxs]
+    vox2sel = {}
+    for local_idx, vk in enumerate(sel_voxel_keys):
+        if vk not in vox2sel:
+            vox2sel[vk] = []
+        vox2sel[vk].append(sel_idxs[local_idx])
+
+    # For each selected voxel group (acts as a cluster), sample a scalar offset and apply along normals
+    for vk, g_indices in vox2sel.items():
+        g_indices = np.array(g_indices, dtype=np.int32)
+        # mean distance of this cluster
+        mean_r = np.linalg.norm(coords[g_indices], axis=1).mean() if g_indices.size > 0 else 0.0
+        sigma = base_std + dist_factor * mean_r
+        # scalar offset sampled once per cluster (correlated jitter)
+        scalar = rng.randn() * sigma
+        normals_cluster = normals[g_indices]
+        # apply along normal direction
+        coords[g_indices] = coords[g_indices] + normals_cluster * scalar
+
+    # --- 4) radial-scale clamp to avoid extreme deformation ---
+    orig_r = np.linalg.norm(block[:, :3], axis=1) + 1e-8
+    new_r = np.linalg.norm(coords, axis=1)
+    scales = np.clip(new_r / orig_r, min_sf, max_sf)
+    coords = block[:, :3] * scales[:, None]
+
+    # write back coords into block
+    block_out = block.copy()
+    block_out[:, :3] = coords.astype(np.float32)
+
+    return block_out, labels, ids
+
+
+# ---------------------------------------------------------------------
+# 2) Distance-biased Point Drop (DBPD)
+# ---------------------------------------------------------------------
+def apply_distance_biased_point_drop(block: np.ndarray, labels: np.ndarray, ids: np.ndarray, config: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Distance-biased point drop: far & sparse regions more likely to be dropped.
+    Same signature as other apply_* functions.
+    """
+    cfg = config.get('distance_biased_point_drop', {})
+    p_frame = cfg.get('prob', 0.5)
+    base_drop = cfg.get('base_drop', 0.04)
+    max_drop = cfg.get('max_drop', 0.5)
+    r_scale = cfg.get('r_scale', 60.0)       # meters (controls distance effect)
+    gamma = cfg.get('gamma', 0.3)           # weight for density effect
+    density_voxel = cfg.get('density_voxel_size', 2.0)  # voxel size for density estimation (meters)
+    protect_small_classes = cfg.get('protect_small_classes', None)  # list or None
+    ignore_label = config.get('ignore_label', 255)
+    rng = np.random
+
+    if block is None or block.shape[0] == 0:
+        return block, labels, ids
+
+    if rng.rand() > p_frame:
+        return block, labels, ids
+
+    coords = block[:, :3].astype(np.float32)
+    N = coords.shape[0]
+
+    # distance-based weight (sigmoid-like mapping)
+    dists = np.linalg.norm(coords, axis=1)
+    dist_norm = dists / max(r_scale, 1e-6)
+    # smooth mapping in [0,1]
+    dist_weight = 1.0 / (1.0 + np.exp(- (dist_norm - 0.5) * 6.0))
+
+    # density estimation via voxel occupancy (coarse)
+    voxel2idx, _ = _compute_voxel_occupancies(coords, voxel_size=density_voxel)
+    # per-point density estimate: number of points in that voxel
+    densities = np.zeros(N, dtype=np.float32)
+    for vk, idxs in voxel2idx.items():
+        count = len(idxs)
+        densities[idxs] = count
+    # normalize density to [0,1] (higher means denser)
+    if densities.max() > densities.min():
+        densities = (densities - densities.min()) / (densities.max() - densities.min())
+    else:
+        densities = np.ones_like(densities) * 0.5
+
+    # combine into drop probability
+    drop_prob = base_drop + (max_drop - base_drop) * dist_weight
+    drop_prob = np.clip(drop_prob + gamma * (1.0 - densities), 0.0, 1.0)
+
+    # if labels given and protect_small_classes requested, reduce drop prob for those points
+    if labels is not None and protect_small_classes:
+        small_mask = np.isin(labels, np.array(protect_small_classes, dtype=labels.dtype))
+        # reduce drop prob (protect) for small classes
+        drop_prob[small_mask] *= cfg.get('protect_scale', 0.5)  # keep 50% of their original drop_prob
+
+    keep_mask = rng.rand(N) > drop_prob
+    if keep_mask.sum() == 0:
+        # ensure at least one point kept
+        keep_mask[rng.randint(0, N)] = True
+
+    block_out = block[keep_mask]
+    labels_out = labels[keep_mask] if labels is not None else labels
+    ids_out = ids[keep_mask] if ids is not None else ids
+
+    return block_out, labels_out, ids_out
+
+
+def apply_intensity_jitter(block: np.ndarray, labels: np.ndarray, ids: np.ndarray, config: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Add random noise to intensity to simulate rain/snow reflection variation
+    """
+    cfg = config.get('intensity_jitter', {})
+    p_frame = cfg.get('prob', 0.5)
+    scale = cfg.get('scale', 0.1)
+    rng = np.random
+
+    if block is None or block.shape[0] == 0 or rng.rand() > p_frame:
+        return block, labels, ids
+
+    block_out = block.copy()
+    block_out[:, 3] += rng.uniform(-scale, scale, size=block_out.shape[0])
+    block_out[:, 3] = np.clip(block_out[:, 3], 0.0, 1.0)
+    return block_out, labels, ids
+
+
+def apply_occlusion_patch(block: np.ndarray, labels: np.ndarray, ids: np.ndarray, config: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+        模拟局部遮挡（Occlusion） 的数据增强方法。它会在点云中随机选几个小区域，把这些区域里的点全部删除，从而模拟真实场景中可能出现的遮挡情况，比如行人被车挡住、物体部分被遮挡、或者 LiDAR 扫描不到某些区域。
+    """
+    cfg = config.get('occlusion_patch', {})
+    p_frame = cfg.get('prob', 0.5)
+    patch_size = cfg.get('patch_size', 2.0)
+    num_patches = cfg.get('num_patches', 1)
+    rng = np.random
+
+    if block is None or block.shape[0] == 0 or rng.rand() > p_frame:
+        return block, labels, ids
+
+    coords = block[:, :3]
+    keep_mask = np.ones(coords.shape[0], dtype=bool)
+    for _ in range(num_patches):
+        center = coords[rng.randint(0, coords.shape[0])]
+        # drop points inside box
+        mask = np.all(np.abs(coords - center) < patch_size / 2, axis=1)
+        keep_mask[mask] = False
+
+    if keep_mask.sum() == 0:
+        keep_mask[rng.randint(0, coords.shape[0])] = True
+
+    block_out = block[keep_mask]
+    labels_out = labels[keep_mask] if labels is not None else labels
+    ids_out = ids[keep_mask] if ids is not None else ids
+    return block_out, labels_out, ids_out
+

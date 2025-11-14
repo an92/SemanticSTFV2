@@ -1,6 +1,6 @@
 model:
   name: minkunet
-  cr: 0.5
+  cr: 1
 
 data:
   num_classes: 19
@@ -17,17 +17,17 @@ src_dataset:
   num_points: 80000
   voxel_size: 0.05
 
-#tgt_dataset:
-#  name: semantickitti    # kitti数据进行测试
-#  root: /home/dataset/SemanticKITTI/sequences
-#  num_points: 80000
-#  voxel_size: 0.05
-
 tgt_dataset:
-  name: semanticstf
-  root: /home/dataset/SemanticSTF
+  name: semantickitti    # kitti数据进行测试
+  root: /home/dataset/SemanticKITTI/sequences
   num_points: 80000
   voxel_size: 0.05
+
+#tgt_dataset:
+#  name: semanticstf
+#  root: /home/dataset/SemanticSTF
+#  num_points: 80000
+#  voxel_size: 0.05
 
 num_epochs: 30
 batch_size: 8

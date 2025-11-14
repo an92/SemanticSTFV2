@@ -52,6 +52,21 @@ src_dataset:
       protect_small_classes: [0,1,2,3,4,5,6,7, 13, 17, 18 ]
       protect_scale: 0.5
 
+    - name: intensity_jitter
+      prob: 0.5
+      scale: 0.1
+
+    - name: occlusion_patch
+      prob: 0.3
+      patch_size: 2.0
+      num_patches: 1
+
+    - name: add_noise_points
+      prob: 0.3
+      min_num: 100
+      max_num: 1000
+      intensity_scale: 0.1
+
 
 #tgt_dataset:
 #  name: semantickitti
