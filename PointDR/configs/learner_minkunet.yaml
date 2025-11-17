@@ -1,12 +1,10 @@
 model:
   name: minkunet_learner
   cr: 0.5
-  lamda_ct: 0.15
-  lamda_sc: 0.1
-  lamda_snc: 0.1
-  k_snc: 8
-  gamma_acp: 12
-  r_median: 0.0  # 自动计算
+  lamda_proto: 0.1
+  lamda_cons: 0.05
+  lamda_info: 0.05
+  gamma_acp: 3.0
 
 
 data:
@@ -19,7 +17,7 @@ train:
   deterministic: False
 
 src_dataset:
-  name: semantickitti   # pointdr原始的数据处理方式
+  name: semantickitti   # pointdr原始的数据处理方式  semantickitti semantic_learner
   root: /home/dataset/SemanticKITTI/sequences
   num_points: 80000
   voxel_size: 0.05

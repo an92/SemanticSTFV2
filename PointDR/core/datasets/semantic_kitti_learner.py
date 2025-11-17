@@ -1,6 +1,7 @@
 import os
 
 import numpy as np
+from scipy import ndimage
 from torchsparse import SparseTensor
 from torchsparse.utils.collate import sparse_collate_fn
 from torchsparse.utils.quantize import sparse_quantize
@@ -133,116 +134,136 @@ class SemanticLearnerKITTIInternal:
         return len(self.files)
 
     def _occlude_components(self, block, pc_full_vox, comps_full, keep_prob=0.6, max_occlude_ratio=0.4):
+        """
+        完全向量化的组件遮挡 (component occlusion)
+        block: 原始点云 (N, 4)
+        pc_full_vox: voxelized 坐标 (N, 3)
+        comps_full: voxel connected component id (N,)
+        """
         unique_comps = np.unique(comps_full)
-        choose_mask = np.random.rand(unique_comps.shape[0]) < 0.2  # 20% chance to apply occlusion to a component
-        chosen = unique_comps[choose_mask]
-        if chosen.size == 0:
+        # 随机选择要遮挡的 component
+        choose_mask = np.random.rand(len(unique_comps)) < 0.2
+        chosen_comps = unique_comps[choose_mask]
+        if chosen_comps.size == 0:
             return block, None
-        rm_mask_global = np.zeros(block.shape[0], dtype=bool)
-        for c in chosen:
-            vox_idx = np.where(comps_full == c)[0]
-            vox_coords_set = set(tuple(pc_full_vox[i]) for i in vox_idx)
-            pts_coords = np.round(block[:, :3] / self.voxel_size).astype(np.int32)
-            mask = np.array([tuple(p) in vox_coords_set for p in pts_coords], dtype=bool)
-            idxs = np.where(mask)[0]
-            if idxs.size == 0:
-                continue
-            pts = block[idxs]
-            ranges = np.linalg.norm(pts[:, :3], axis=1)
-            order = np.argsort(-ranges)
-            num_rm = int(np.ceil(max_occlude_ratio * idxs.size))
-            rm_idx_local = idxs[order[:num_rm]]
-            rm_mask_global[rm_idx_local] = True
-        final_rm = rm_mask_global & (np.random.rand(rm_mask_global.shape[0]) < (1.0 - keep_prob))
-        if final_rm.sum() > 0:
-            block = block[~final_rm]
-        return block, final_rm
+
+        # 找到需要删除的点
+        rm_mask_global = np.isin(comps_full, chosen_comps)
+        if rm_mask_global.sum() == 0:
+            return block, None
+
+        # 按距离排序，保留近距离点
+        pts_to_remove = np.where(rm_mask_global)[0]
+        ranges = np.linalg.norm(block[pts_to_remove, :3], axis=1)
+        order = np.argsort(-ranges)  # 远距离优先删除
+        num_rm = int(np.ceil(max_occlude_ratio * len(pts_to_remove)))
+        rm_idx = pts_to_remove[order[:num_rm]]
+
+        # 根据 keep_prob 再随机丢弃
+        final_mask = np.zeros(block.shape[0], dtype=bool)
+        keep_random = np.random.rand(len(rm_idx)) > keep_prob
+        final_mask[rm_idx[keep_random]] = True
+
+        if final_mask.sum() > 0:
+            block = block[~final_mask]
+
+        return block, final_mask if final_mask.sum() > 0 else None
 
     def _attenuate_by_range(self, block, min_keep=0.6, max_keep=0.95):
         pts = block[:, :3]
         ranges = np.linalg.norm(pts, axis=1)
         rmin, rmax = ranges.min(), ranges.max()
         if rmax - rmin < 1e-6:
-            return block
-        norm_r = (ranges - rmin) / (rmax - rmin)  # 0..1
+            return np.ones(block.shape[0], dtype=bool)
+        norm_r = (ranges - rmin) / (rmax - rmin)
         keep_probs = max_keep - (max_keep - min_keep) * norm_r
         keep_mask = np.random.rand(block.shape[0]) < keep_probs
-        return block[keep_mask]
+        return keep_mask
 
-    def _scatter_noise(self, block, num_noise_factor=0.01):
+    def _scatter_noise(self, block, labels, ids, num_noise_factor=0.01):
+        """
+        向点云中添加噪声点（一次性向量化生成）
+        """
         N = block.shape[0]
-        noise_num = max(0, int(N * num_noise_factor))
-        if noise_num == 0:
-            return block
-        idx = np.random.choice(np.arange(N), noise_num, replace=True)
+        num_noise = max(0, int(N * num_noise_factor))
+        if num_noise == 0:
+            return block, labels, ids
+
+        # 随机选择点中心
+        idx = np.random.choice(N, num_noise, replace=True)
         centers = block[idx, :3]
-        jitter = np.random.normal(scale=0.02, size=(noise_num, 3)).astype(np.float32)  # 2cm jitter
-        noise_i = np.random.normal(loc=np.mean(block[:, 3]), scale=0.5, size=(noise_num,)).astype(np.float32)
-        noise_pts = np.concatenate([centers + jitter, noise_i.reshape(-1, 1)], axis=1)
-        block = np.concatenate([block, noise_pts], axis=0)
-        return block
+
+        # 随机扰动 jitter
+        jitter = np.random.normal(scale=0.02, size=(num_noise, 3)).astype(np.float32)
+
+        # 激光强度噪声
+        noise_i = np.random.normal(loc=np.mean(block[:, 3]), scale=0.5, size=(num_noise, 1)).astype(np.float32)
+
+        noise_pts = np.hstack([centers + jitter, noise_i])
+
+        block = np.vstack([block, noise_pts])
+        labels = np.concatenate([labels, np.ones(num_noise, dtype=np.int64) * 255])
+        ids = np.concatenate([ids, -np.ones(num_noise, dtype=np.int64)])
+
+        return block, labels, ids
 
     def _compute_components(self, pc_full):
-        N = pc_full.shape[0]
-        coord_to_idx = {(int(x), int(y), int(z)): i for i, (x, y, z) in enumerate(pc_full)}
-        visited = np.zeros(N, dtype=np.bool_)
-        comps = np.full(N, -1, dtype=np.int32)
-        comp_id = 0
-        neigh = [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)]
-        for i in range(N):
-            if visited[i]:
-                continue
-            stack = [i]
-            visited[i] = True
-            comps[i] = comp_id
-            while stack:
-                cur = stack.pop()
-                cx, cy, cz = pc_full[cur]
-                for dx, dy, dz in neigh:
-                    nb = (int(cx + dx), int(cy + dy), int(cz + dz))
-                    j = coord_to_idx.get(nb, None)
-                    if j is not None and (not visited[j]):
-                        visited[j] = True
-                        comps[j] = comp_id
-                        stack.append(j)
-            comp_id += 1
+        """
+        输入:
+            pc_full: (N,3) int32 voxelized point coordinates
+        输出:
+            comps: (N,) 每个 voxel 的 connected component id
+        """
+        # 构建稀疏占据体素 grid
+        coords = pc_full - pc_full.min(0)  # 保证坐标从 0 开始
+        shape = coords.max(0) + 1
+
+        # 构建稀疏 voxel occupancy grid
+        grid = np.zeros(shape, dtype=np.int32)
+        grid[coords[:, 0], coords[:, 1], coords[:, 2]] = 1
+
+        # 使用 6 邻域连通域标记
+        structure = np.zeros((3, 3, 3), dtype=int)
+        structure[1, 1, 0] = structure[1, 1, 2] = 1
+        structure[1, 0, 1] = structure[1, 2, 1] = 1
+        structure[0, 1, 1] = structure[2, 1, 1] = 1
+
+        labeled, num_features = ndimage.label(grid, structure=structure)
+
+        # 将 voxel label 映射回每个点
+        comps = labeled[coords[:, 0], coords[:, 1], coords[:, 2]]
+
         return comps
 
     def __getitem__(self, index):
         with open(self.files[index], 'rb') as b:
             block_ = np.fromfile(b, dtype=np.float32).reshape(-1, 4)
-        # assign an id for each point for consistency
         ids = np.arange(block_.shape[0])
-        # read labels
+        # 读取 labels
         label_file = self.files[index].replace('velodyne', 'labels').replace('.bin', '.label')
         if os.path.exists(label_file):
             with open(label_file, 'rb') as a:
                 all_labels = np.fromfile(a, dtype=np.int32).reshape(-1)
         else:
-            all_labels = np.zeros(block_.shape[0]).astype(np.int32)
+            all_labels = np.zeros(block_.shape[0], dtype=np.int32)
         labels_ = self.label_map[all_labels & 0xFFFF].astype(np.int64)
 
-        #######################
-        # original view #
-        #######################
+        # ----------------------
+        # original view
+        # ----------------------
         block_1 = block_.copy()
         theta = np.random.uniform(0, 2 * np.pi)
         scale_factor = np.random.uniform(0.95, 1.05)
         rot_mat = np.array([[np.cos(theta), np.sin(theta), 0],
-                            [-np.sin(theta),
-                             np.cos(theta), 0], [0, 0, 1]])
-        block_1[:, :3] = np.dot(block_1[:, :3], rot_mat) * scale_factor
-        # voxelization
+                            [-np.sin(theta), np.cos(theta), 0],
+                            [0, 0, 1]])
+        block_1[:, :3] = block_1[:, :3] @ rot_mat.T * scale_factor
         pc_1_ = np.round(block_1[:, :3] / self.voxel_size).astype(np.int32)
         pc_1_ -= pc_1_.min(0, keepdims=1)
-
         feat_1_ = block_1
-        _, inds_1, inverse_map = sparse_quantize(pc_1_,
-                                                 return_index=True,
-                                                 return_inverse=True)
+        _, inds_1, inverse_map = sparse_quantize(pc_1_, return_index=True, return_inverse=True)
         if len(inds_1) > self.num_points:
-            inds_1 = np.random.choice(inds_1, self.num_points, replace=False)  # Note this step causes cuda problem if evaluating
-
+            inds_1 = np.random.choice(inds_1, self.num_points, replace=False)
         pc_1 = pc_1_[inds_1]
         feat_1 = feat_1_[inds_1]
         labels_1 = labels_[inds_1]
@@ -251,85 +272,85 @@ class SemanticLearnerKITTIInternal:
         labels_1 = SparseTensor(labels_1, pc_1)
         ids_1 = SparseTensor(ids_1, pc_1)
         inverse_map = SparseTensor(inverse_map, pc_1_)
-        comps_full = self._compute_components(pc_1_)  # shape (num_voxels_full,)
-        comps_sampled = comps_full[inds_1]  # align with sampled points
-        components_1 = SparseTensor(comps_sampled.astype(np.int32), pc_1)
 
-
-        #######################
-        #    augmented view   #
-        #######################
+        # ----------------------
+        # augmented view
+        # ----------------------
         block_2 = block_.copy()
         labels_2 = labels_.copy()
-        ids_2_full = ids.copy()  # will maintain mapping to original point indices
+        ids_2_full = ids.copy()
+        correspond_idx = np.arange(block_2.shape[0])
 
-        if self.split == 'train':
-            block_2, _ = self._occlude_components(block_2, pc_1_, comps_full, keep_prob=0.7, max_occlude_ratio=0.45)
-            # attenuation by range
-            if np.random.rand() < 0.7:
-                block_2 = self._attenuate_by_range(block_2, min_keep=0.6, max_keep=0.95)
-            # scatter noise
-            if np.random.rand() < 0.5:
-                block_2 = self._scatter_noise(block_2, num_noise_factor=0.01)
+        # 1. voxelization & connected components
+        pc_full_vox = np.round(block_2[:, :3] / self.voxel_size).astype(np.int32)
+        pc_full_vox -= pc_full_vox.min(0, keepdims=True)
+        comps_full = self._compute_components(pc_full_vox)
 
-        # aug1: random drop out
-        if np.random.random() < 0.5:
-            idxes = np.arange(block_.shape[0])
-            ratio = np.random.random() * 0.2 + 0.8  # 0.8 - 1
-            if idxes.size > 0:
-                idxes = np.random.choice(idxes, int(ratio * block_.shape[0]), replace=False)
-                block_2 = block_2[idxes]
-                labels_2 = labels_2[idxes]
-        # aug2: add noise
-        if np.random.random() < 0.5:
-            xmin, xmax = block_[:, 0].min(), block_[:, 0].max()
-            ymin, ymax = block_[:, 1].min(), block_[:, 1].max()
-            zmin, zmax = block_[:, 2].min(), block_[:, 2].max()
-            imin, imax = block_[:, 3].min(), block_[:, 3].max()
-            noise_num = int(np.random.random() * 2000)
-            noise_x = np.random.choice(np.arange(xmin, xmax, 0.01), noise_num, replace=True).astype(np.float32)
-            noise_y = np.random.choice(np.arange(ymin, ymax, 0.01), noise_num, replace=True).astype(np.float32)
-            noise_z = np.random.choice(np.arange(zmin, zmax, 0.01), noise_num, replace=True).astype(np.float32)
-            noise_i = np.random.normal(loc=(imin + imax) / 2, scale=0.5, size=noise_num).astype(np.float32)
-            noise = np.stack((noise_x, noise_y, noise_z, noise_i), axis=1)
-            block_2 = np.concatenate((block_2, noise), axis=0)
-            labels_2 = np.concatenate((labels_2, np.ones(noise.shape[0], dtype=np.int64) * 255), axis=0)
-            ids = np.concatenate((ids, np.ones(noise.shape[0], dtype=np.int64) * (-1)), axis=0)
-        # aug3: rotate and scale
-        if np.random.random() < 1.0:
-            theta = np.random.uniform(0, 2 * np.pi)
-            scale_factor = np.random.uniform(0.95, 1.05)
-            rot_mat = np.array([[np.cos(theta), np.sin(theta), 0],
-                                [-np.sin(theta),
-                                 np.cos(theta), 0], [0, 0, 1]])
-            block_2[:, :3] = np.dot(block_2[:, :3], rot_mat) * scale_factor
-        # aug4: flip along X axis
+        # # 2. occlude components (vector化)
+        # unique_comps = np.unique(comps_full)
+        # mask_choose = np.random.rand(len(unique_comps)) < 0.2
+        # chosen_comps = unique_comps[mask_choose]
+        # rm_mask_global = np.isin(comps_full, chosen_comps)
+        # if rm_mask_global.sum() > 0:
+        #     rm_mask_final = rm_mask_global & (np.random.rand(rm_mask_global.shape[0]) < 0.2)
+        #     block_2 = block_2[~rm_mask_final]
+        #     labels_2 = labels_2[~rm_mask_final]
+        #     ids_2_full = ids_2_full[~rm_mask_final]
+        #     correspond_idx = correspond_idx[~rm_mask_final]
+        #
+        # # 3. attenuation by range
+        # if np.random.rand() < 0.7:
+        #     keep_mask = self._attenuate_by_range(block_2, min_keep=0.6, max_keep=0.95)
+        #     block_2 = block_2[keep_mask]
+        #     labels_2 = labels_2[keep_mask]
+        #     ids_2_full = ids_2_full[keep_mask]
+        #     correspond_idx = correspond_idx[keep_mask]
+        #
+        # # 4. scatter noise (一次生成)
+        # if np.random.rand() < 0.5:
+        #     block_2, labels_2, ids_2_full = self._scatter_noise(block_2, labels_2, ids_2_full, num_noise_factor=0.01)
+        #     num_noise = block_2.shape[0] - len(correspond_idx)
+        #     if num_noise > 0:
+        #         correspond_idx = np.concatenate([correspond_idx, -np.ones(num_noise, dtype=np.int32)])
+
+        # 5. random dropout
         if np.random.rand() < 0.5:
-            block_2[:, 0] *= -1
-        # aug5: flip along Y axis
+            ratio = np.random.uniform(0.8, 1.0)
+            idxes = np.random.choice(block_2.shape[0], int(ratio * block_2.shape[0]), replace=False)
+            block_2 = block_2[idxes]
+            labels_2 = labels_2[idxes]
+            ids_2_full = ids_2_full[idxes]
+            correspond_idx = correspond_idx[idxes]
+
+        # 6. rotation, scaling, flip, jitter
+        theta = np.random.uniform(0, 2 * np.pi)
+        scale_factor = np.random.uniform(0.95, 1.05)
+        rot_mat = np.array([[np.cos(theta), np.sin(theta), 0],
+                            [-np.sin(theta), np.cos(theta), 0],
+                            [0, 0, 1]])
+        block_2[:, :3] = block_2[:, :3] @ rot_mat.T * scale_factor
+        if np.random.rand() < 0.5: block_2[:, 0] *= -1
+        if np.random.rand() < 0.5: block_2[:, 1] *= -1
         if np.random.rand() < 0.5:
-            block_2[:, 1] *= -1
-        # aug6: random jittering
-        if np.random.rand() < 0.5:
-            jiterring = np.random.normal(loc=0., scale=0.01, size=(block_.shape[0], 3))
-            jiterring = np.clip(jiterring, a_min=-0.05, a_max=0.05)
-            block_[:, :3] += jiterring
+            jitter = np.clip(np.random.normal(0, 0.01, size=(block_2.shape[0], 3)), -0.05, 0.05)
+            block_2[:, :3] += jitter
+
+        # 7. voxelization & sparse tensor
         feat_2_ = block_2
         pc_2_ = np.round(block_2[:, :3] / self.voxel_size).astype(np.int32)
         pc_2_ -= pc_2_.min(0, keepdims=1)
-        _, inds_2, _ = sparse_quantize(pc_2_,
-                                       return_index=True,
-                                       return_inverse=True)
-        ratio = np.random.random() * 0.2 + 0.8
+        _, inds_2, _ = sparse_quantize(pc_2_, return_index=True, return_inverse=True)
+        ratio = np.random.rand() * 0.2 + 0.8
         if len(inds_2) > int(self.num_points * ratio):
             inds_2 = np.random.choice(inds_2, int(self.num_points * ratio), replace=False)
         pc_2 = pc_2_[inds_2]
         labels_2 = labels_2[inds_2]
         feat_2 = feat_2_[inds_2]
-        ids_2 = ids[inds_2]
+        ids_2 = ids_2_full[inds_2]
         lidar_2 = SparseTensor(feat_2, pc_2)
         labels_2 = SparseTensor(labels_2, pc_2)
         ids_2 = SparseTensor(ids_2, pc_2)
+        correspond_idx =correspond_idx
 
         return {
             'lidar': lidar_1,
@@ -337,11 +358,10 @@ class SemanticLearnerKITTIInternal:
             'inverse_map_dense': inverse_map,
             'file_name': self.files[index],
             'ids_1': ids_1,
-            'components': components_1,  # NEW: component id per sampled point in lidar_1
-
             'lidar_2': lidar_2,
             'ids_2': ids_2,
-            'targets_2': labels_2
+            'targets_2': labels_2,
+            'correspond_idx': correspond_idx
         }
     @staticmethod
     def collate_fn(inputs):

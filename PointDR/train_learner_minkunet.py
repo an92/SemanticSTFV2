@@ -43,7 +43,7 @@ def main() -> None:
     logger.info(f'Experiment started: "{args.run_dir}".' + '\n' + f'{configs}')
 
     if ('seed' not in configs.train) or (configs.train.seed is None):
-        configs.train.seed = torch.initial_seed() % (2 ** 32 - 1)
+        configs.train.seed = torch.initial_seed() % (2**32 - 1)
 
     seed = configs.train.seed + dist.rank() * configs.workers_per_gpu * configs.num_epochs
     random.seed(seed)
@@ -54,8 +54,7 @@ def main() -> None:
     dataset = builder.make_dataset()
     dataflow = {}
     for split in dataset:
-        sampler = torch.utils.data.distributed.DistributedSampler(dataset[split], num_replicas=dist.size(),
-                                                                  rank=dist.rank(), shuffle=(split == 'train'))
+        sampler = torch.utils.data.distributed.DistributedSampler(dataset[split], num_replicas=dist.size(), rank=dist.rank(), shuffle=(split == 'train'))
         dataflow[split] = torch.utils.data.DataLoader(dataset[split],
                                                       batch_size=configs.batch_size,
                                                       sampler=sampler,
@@ -66,8 +65,7 @@ def main() -> None:
     model = builder.make_model().cuda()
 
     if configs.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[dist.local_rank()],
-                                                          find_unused_parameters=True)
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[dist.local_rank()], find_unused_parameters=True)
 
     criterion = builder.make_criterion()
     optimizer = builder.make_optimizer(model)
@@ -81,29 +79,22 @@ def main() -> None:
         num_workers=configs.workers_per_gpu,
         seed=seed,
         amp_enabled=configs.amp_enabled,
-        lamda_ct = configs.model.lamda_ct,
-        lamda_sc= configs.model.lamda_sc,
-        lamda_snc= configs.model.lamda_snc,
-        k_snc= configs.model.k_snc,
+        lamda_proto=configs.model.lamda_proto,
+        lamda_cons=configs.model.lamda_cons,
+        lamda_info=configs.model.lamda_info,
     )
 
-    trainer.train_with_defaults(
-        dataflow['train'],
-        num_epochs=configs.num_epochs,
-        callbacks=[InferenceRunner(
-            dataflow['test'],
-            callbacks=[
-                MeanIoU(
-                    name=f'iou/test',
-                    num_classes=configs.data.num_classes,
-                    ignore_label=configs.data.ignore_label
-                ),
-            ],
-        )] + [
-            BestEpochSaver('iou/test', filename='best_epoch'),
-            EpochSaver(max_to_keep=None),
-        ]
-    )
+    trainer.train_with_defaults(dataflow['train'],
+                                num_epochs=configs.num_epochs,
+                                callbacks=[InferenceRunner(
+                                    dataflow['test'],
+                                    callbacks=[
+                                        MeanIoU(name=f'iou/test', num_classes=configs.data.num_classes, ignore_label=configs.data.ignore_label),
+                                    ],
+                                )] + [
+                                    BestEpochSaver('iou/test', filename='best_epoch'),
+                                    EpochSaver(max_to_keep=None),
+                                ])
 
 
 if __name__ == '__main__':

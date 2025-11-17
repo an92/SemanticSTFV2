@@ -131,7 +131,6 @@ def make_model() -> nn.Module:
             num_classes=configs.data.num_classes,
             cr=cr,
             gamma_acp=configs.model.gamma_acp,
-            r_median=configs.model.r_median,
         )
     else:
         raise NotImplementedError(configs.model.name)

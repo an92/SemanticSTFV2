@@ -55,133 +55,174 @@ class ResidualBlock(nn.Module):
 class MinkUNet_Learner(nn.Module):
     def __init__(self, **kwargs):
         super().__init__()
+
         cr = kwargs.get('cr', 1.0)
         cs = [32, 32, 64, 128, 256, 256, 128, 96, 96]
         cs = [int(cr * x) for x in cs]
+        self.run_up = kwargs.get('run_up', True)
+        self.gamma_acp =  kwargs.get('gamma_acp', 3.0)
 
         self.stem = nn.Sequential(
             spnn.Conv3d(4, cs[0], kernel_size=3, stride=1),
             spnn.BatchNorm(cs[0]), spnn.ReLU(True),
             spnn.Conv3d(cs[0], cs[0], kernel_size=3, stride=1),
-            spnn.BatchNorm(cs[0]), spnn.ReLU(True),
-        )
+            spnn.BatchNorm(cs[0]), spnn.ReLU(True))
 
-        # Encoder
         self.stage1 = nn.Sequential(
-            BasicConvolutionBlock(cs[0], cs[0], ks=2, stride=2),
-            ResidualBlock(cs[0], cs[1]),
-            ResidualBlock(cs[1], cs[1]),
-        )
-        self.stage2 = nn.Sequential(
-            BasicConvolutionBlock(cs[1], cs[1], ks=2, stride=2),
-            ResidualBlock(cs[1], cs[2]),
-            ResidualBlock(cs[2], cs[2]),
-        )
-        self.stage3 = nn.Sequential(
-            BasicConvolutionBlock(cs[2], cs[2], ks=2, stride=2),
-            ResidualBlock(cs[2], cs[3]),
-            ResidualBlock(cs[3], cs[3]),
-        )
-        self.stage4 = nn.Sequential(
-            BasicConvolutionBlock(cs[3], cs[3], ks=2, stride=2),
-            ResidualBlock(cs[3], cs[4]),
-            ResidualBlock(cs[4], cs[4]),
+            BasicConvolutionBlock(cs[0], cs[0], ks=2, stride=2, dilation=1),
+            ResidualBlock(cs[0], cs[1], ks=3, stride=1, dilation=1),
+            ResidualBlock(cs[1], cs[1], ks=3, stride=1, dilation=1),
         )
 
-        # Decoder
+        self.stage2 = nn.Sequential(
+            BasicConvolutionBlock(cs[1], cs[1], ks=2, stride=2, dilation=1),
+            ResidualBlock(cs[1], cs[2], ks=3, stride=1, dilation=1),
+            ResidualBlock(cs[2], cs[2], ks=3, stride=1, dilation=1))
+
+        self.stage3 = nn.Sequential(
+            BasicConvolutionBlock(cs[2], cs[2], ks=2, stride=2, dilation=1),
+            ResidualBlock(cs[2], cs[3], ks=3, stride=1, dilation=1),
+            ResidualBlock(cs[3], cs[3], ks=3, stride=1, dilation=1),
+        )
+
+        self.stage4 = nn.Sequential(
+            BasicConvolutionBlock(cs[3], cs[3], ks=2, stride=2, dilation=1),
+            ResidualBlock(cs[3], cs[4], ks=3, stride=1, dilation=1),
+            ResidualBlock(cs[4], cs[4], ks=3, stride=1, dilation=1),
+        )
+
         self.up1 = nn.ModuleList([
             BasicDeconvolutionBlock(cs[4], cs[5], ks=2, stride=2),
             nn.Sequential(
-                ResidualBlock(cs[5] + cs[3], cs[5]),
-                ResidualBlock(cs[5], cs[5]),
+                ResidualBlock(cs[5] + cs[3], cs[5], ks=3, stride=1, dilation=1),
+                ResidualBlock(cs[5], cs[5], ks=3, stride=1, dilation=1),
             )
         ])
+
         self.up2 = nn.ModuleList([
             BasicDeconvolutionBlock(cs[5], cs[6], ks=2, stride=2),
             nn.Sequential(
-                ResidualBlock(cs[6] + cs[2], cs[6]),
-                ResidualBlock(cs[6], cs[6]),
+                ResidualBlock(cs[6] + cs[2], cs[6], ks=3, stride=1, dilation=1),
+                ResidualBlock(cs[6], cs[6], ks=3, stride=1, dilation=1),
             )
         ])
+
         self.up3 = nn.ModuleList([
             BasicDeconvolutionBlock(cs[6], cs[7], ks=2, stride=2),
             nn.Sequential(
-                ResidualBlock(cs[7] + cs[1], cs[7]),
-                ResidualBlock(cs[7], cs[7]),
+                ResidualBlock(cs[7] + cs[1], cs[7], ks=3, stride=1, dilation=1),
+                ResidualBlock(cs[7], cs[7], ks=3, stride=1, dilation=1),
             )
         ])
+
         self.up4 = nn.ModuleList([
             BasicDeconvolutionBlock(cs[7], cs[8], ks=2, stride=2),
             nn.Sequential(
-                ResidualBlock(cs[8] + cs[0], cs[8]),
-                ResidualBlock(cs[8], cs[8]),
+                ResidualBlock(cs[8] + cs[0], cs[8], ks=3, stride=1, dilation=1),
+                ResidualBlock(cs[8], cs[8], ks=3, stride=1, dilation=1),
             )
         ])
 
-        self.classifier = nn.Sequential(
-            nn.Linear(cs[8], kwargs['num_classes'])
-        )
+        self.classifier = nn.Sequential(nn.Linear(cs[8], kwargs['num_classes']))
 
-        # Pointwise transforms & projection head
         self.point_transforms = nn.ModuleList([
-            nn.Sequential(nn.Linear(cs[0], cs[4]), nn.BatchNorm1d(cs[4]), nn.ReLU(True)),
-            nn.Sequential(nn.Linear(cs[4], cs[6]), nn.BatchNorm1d(cs[6]), nn.ReLU(True)),
-            nn.Sequential(nn.Linear(cs[6], cs[8]), nn.BatchNorm1d(cs[8]), nn.ReLU(True))
+            nn.Sequential(
+                nn.Linear(cs[0], cs[4]),
+                nn.BatchNorm1d(cs[4]),
+                nn.ReLU(True),
+            ),
+            nn.Sequential(
+                nn.Linear(cs[4], cs[6]),
+                nn.BatchNorm1d(cs[6]),
+                nn.ReLU(True),
+            ),
+            nn.Sequential(
+                nn.Linear(cs[6], cs[8]),
+                nn.BatchNorm1d(cs[8]),
+                nn.ReLU(True),
+            )
         ])
+
+        self.dropout = nn.Dropout(0.3, True)
+
+        # projection head
         self.proj = nn.Sequential(
             nn.Linear(cs[8], cs[8]),
             nn.ReLU(inplace=True),
-            nn.Linear(cs[8], 128)
-        )
+            nn.Linear(cs[8], 128))
 
-        # Momentum memory banks
-        num_classes = kwargs['num_classes']
-        proj_dim = 128
+        # create the momentum memory bank to save prototypes
+        self.num_classes = kwargs['num_classes']
+        # ---------------- Adaptive Prototype & Memory Bank ----------------
+        self.register_buffer("memo_bank_B", torch.zeros(self.num_classes, 128))
+        self.register_buffer("memo_bank_G", torch.zeros(self.num_classes, 128))
+        self.register_buffer("class_counts", torch.zeros(self.num_classes))
+
+        # Momentum
         self.m = 0.99
         self.m_global = 0.999
-        self.gamma_acp = kwargs['gamma_acp']
-
-        self.register_buffer("memo_bank_B", torch.zeros(num_classes, proj_dim))
-        self.register_buffer("memo_bank_G", torch.zeros(num_classes, proj_dim))
-        self.register_buffer("class_counts", torch.zeros(num_classes))
-        self.r_median =  kwargs['r_median']
-
         self.weight_initialization()
+
 
     @torch.no_grad()
     def momentum_update_B(self, feat_proto_B, init=False):
         if init:
-            self.memo_bank_B = feat_proto_B
+            self.memo_bank_B.copy_(feat_proto_B)
         else:
-            self.memo_bank_B = self.memo_bank_B * self.m + feat_proto_B * (1. - self.m)
+            self.memo_bank_B.mul_(self.m).add_(feat_proto_B * (1. - self.m))
+        # DDP 同步
+        if torch.distributed.is_initialized():
+            torch.distributed.all_reduce(self.memo_bank_B, op=torch.distributed.ReduceOp.SUM)
+            self.memo_bank_B /= torch.distributed.get_world_size()
 
     @torch.no_grad()
     def momentum_update_G(self, feat_proto_G, init=False):
         if init:
-            self.memo_bank_G = feat_proto_G
+            self.memo_bank_G.copy_(feat_proto_G)
         else:
-            self.memo_bank_G = self.memo_bank_G * self.m_global + feat_proto_G * (1. - self.m_global)
+            self.memo_bank_G.mul_(self.m_global).add_(feat_proto_G * (1. - self.m_global))
+
+        if torch.distributed.is_initialized():
+            torch.distributed.all_reduce(self.memo_bank_G, op=torch.distributed.ReduceOp.SUM)
+            self.memo_bank_G /= torch.distributed.get_world_size()
 
     @torch.no_grad()
-    def get_adaptive_prototype(self, targets_1: torch.Tensor, current_batch_counts: torch.Tensor):
-        self.class_counts += current_batch_counts.cpu().to(self.class_counts.device)
-        non_zero_counts = self.class_counts[self.class_counts > 0]
-        if non_zero_counts.numel() > 0:
-            self.r_median = non_zero_counts.median()
+    def momentum_update_key_encoder(self, feat, init=False):
+        """更新 memory bank，用于 infoNCE loss"""
+        if not hasattr(self, 'memo_bank'):
+            # 初始化
+            self.register_buffer('memo_bank', torch.zeros(self.num_classes, feat.shape[1]))
+        if init:
+            self.memo_bank.copy_(feat)
+        else:
+            self.memo_bank.mul_(self.m).add_(feat * (1. - self.m))
 
-        R_c = current_batch_counts.to(self.class_counts.device)
+        if torch.distributed.is_initialized():
+            torch.distributed.all_reduce(self.memo_bank, op=torch.distributed.ReduceOp.SUM)
+            self.memo_bank /= torch.distributed.get_world_size()
+
+    @torch.no_grad()
+    def get_adaptive_prototype(self, targets, current_batch_counts):
+        device = self.memo_bank_B.device
+        self.class_counts += current_batch_counts.cpu().to(device)
+        non_zero = self.class_counts[self.class_counts > 0]
+        if non_zero.numel() > 0:
+            self.r_median = non_zero.median().to(device)
+
+        R_c = current_batch_counts.to(device)
         diff = R_c - self.r_median
         active_classes = (R_c > 0)
         alpha_c = torch.ones_like(R_c) * 0.5
         if self.r_median > 0:
             alpha_c[active_classes] = torch.sigmoid(self.gamma_acp * (diff[active_classes] / self.r_median))
-        alpha_c = alpha_c.view(1, -1).to(self.memo_bank_B.device)  # shape: 1 x C
+        alpha_c = alpha_c.view(1, -1).to(device)
 
-        P_B = self.memo_bank_B.T.detach()  # D x C
-        P_G = self.memo_bank_G.T.detach()  # D x C
-        P_adaptive = P_B * alpha_c + P_G * (1.0 - alpha_c)  # broadcasting safe
+        P_B = self.memo_bank_B.T.detach()
+        P_G = self.memo_bank_G.T.detach()
+        P_adaptive = P_B * alpha_c + P_G * (1. - alpha_c)
 
         return P_adaptive, alpha_c.mean().item()
+
 
     def weight_initialization(self):
         for m in self.modules():
