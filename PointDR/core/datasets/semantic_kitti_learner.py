@@ -18,6 +18,7 @@ class SemanticLearnerKITTI(dict):
         submit_to_server = kwargs.get('submit', False)
         sample_stride = kwargs.get('sample_stride', 1)
         google_mode = kwargs.get('google_mode', False)
+        self.augment = kwargs.get('args', {})
 
         logger.info("SemanticKITTI  Learner")
 
@@ -236,82 +237,77 @@ class SemanticLearnerKITTIInternal:
         return comps
 
     def __getitem__(self, index):
-        with open(self.files[index], 'rb') as b:
-            block_ = np.fromfile(b, dtype=np.float32).reshape(-1, 4)
-        ids = np.arange(block_.shape[0])
-        # 读取 labels
+        # ---------------- Load raw point cloud ----------------
+        with open(self.files[index], 'rb') as f:
+            block = np.fromfile(f, dtype=np.float32).reshape(-1, 4)  # (N,4)
+        ids = np.arange(block.shape[0])
+
+        # Load labels
         label_file = self.files[index].replace('velodyne', 'labels').replace('.bin', '.label')
         if os.path.exists(label_file):
-            with open(label_file, 'rb') as a:
-                all_labels = np.fromfile(a, dtype=np.int32).reshape(-1)
+            with open(label_file, 'rb') as f:
+                all_labels = np.fromfile(f, dtype=np.int32).reshape(-1)
         else:
-            all_labels = np.zeros(block_.shape[0], dtype=np.int32)
-        labels_ = self.label_map[all_labels & 0xFFFF].astype(np.int64)
+            all_labels = np.zeros(block.shape[0], dtype=np.int32)
+        labels = self.label_map[all_labels & 0xFFFF].astype(np.int64)
 
-        # ----------------------
-        # original view
-        # ----------------------
-        block_1 = block_.copy()
+        # ---------------- Original view ----------------
+        block_1 = block.copy()
         theta = np.random.uniform(0, 2 * np.pi)
-        scale_factor = np.random.uniform(0.95, 1.05)
+        scale = np.random.uniform(0.95, 1.05)
         rot_mat = np.array([[np.cos(theta), np.sin(theta), 0],
                             [-np.sin(theta), np.cos(theta), 0],
                             [0, 0, 1]])
-        block_1[:, :3] = block_1[:, :3] @ rot_mat.T * scale_factor
+        block_1[:, :3] = block_1[:, :3] @ rot_mat.T * scale
+
         pc_1_ = np.round(block_1[:, :3] / self.voxel_size).astype(np.int32)
         pc_1_ -= pc_1_.min(0, keepdims=1)
-        feat_1_ = block_1
+        feat_1_ = block_1.copy()
+        labels_1_ = labels.copy()
+        ids_1_ = ids.copy()
         _, inds_1, inverse_map = sparse_quantize(pc_1_, return_index=True, return_inverse=True)
+
+        # 采样固定点数
         if len(inds_1) > self.num_points:
             inds_1 = np.random.choice(inds_1, self.num_points, replace=False)
+        elif len(inds_1) < self.num_points:
+            inds_1 = np.random.choice(inds_1, self.num_points, replace=True)
+
         pc_1 = pc_1_[inds_1]
         feat_1 = feat_1_[inds_1]
-        labels_1 = labels_[inds_1]
-        ids_1 = ids[inds_1]
+        labels_1 = labels_1_[inds_1]
+        ids_1 = ids_1_[inds_1]
         lidar_1 = SparseTensor(feat_1, pc_1)
         labels_1 = SparseTensor(labels_1, pc_1)
         ids_1 = SparseTensor(ids_1, pc_1)
         inverse_map = SparseTensor(inverse_map, pc_1_)
 
-        # ----------------------
-        # augmented view
-        # ----------------------
-        block_2 = block_.copy()
-        labels_2 = labels_.copy()
-        ids_2_full = ids.copy()
-        correspond_idx = np.arange(block_2.shape[0])
+        # ---------------- Augmented view ----------------
+        block_2 = block.copy()
+        labels_2 = labels.copy()
+        ids_2 = ids.copy()
 
-        # 1. voxelization & connected components
+        # 1. compute voxel components
         pc_full_vox = np.round(block_2[:, :3] / self.voxel_size).astype(np.int32)
         pc_full_vox -= pc_full_vox.min(0, keepdims=True)
         comps_full = self._compute_components(pc_full_vox)
 
-        # # 2. occlude components (vector化)
-        # unique_comps = np.unique(comps_full)
-        # mask_choose = np.random.rand(len(unique_comps)) < 0.2
-        # chosen_comps = unique_comps[mask_choose]
-        # rm_mask_global = np.isin(comps_full, chosen_comps)
-        # if rm_mask_global.sum() > 0:
-        #     rm_mask_final = rm_mask_global & (np.random.rand(rm_mask_global.shape[0]) < 0.2)
-        #     block_2 = block_2[~rm_mask_final]
-        #     labels_2 = labels_2[~rm_mask_final]
-        #     ids_2_full = ids_2_full[~rm_mask_final]
-        #     correspond_idx = correspond_idx[~rm_mask_final]
-        #
-        # # 3. attenuation by range
-        # if np.random.rand() < 0.7:
-        #     keep_mask = self._attenuate_by_range(block_2, min_keep=0.6, max_keep=0.95)
-        #     block_2 = block_2[keep_mask]
-        #     labels_2 = labels_2[keep_mask]
-        #     ids_2_full = ids_2_full[keep_mask]
-        #     correspond_idx = correspond_idx[keep_mask]
-        #
-        # # 4. scatter noise (一次生成)
-        # if np.random.rand() < 0.5:
-        #     block_2, labels_2, ids_2_full = self._scatter_noise(block_2, labels_2, ids_2_full, num_noise_factor=0.01)
-        #     num_noise = block_2.shape[0] - len(correspond_idx)
-        #     if num_noise > 0:
-        #         correspond_idx = np.concatenate([correspond_idx, -np.ones(num_noise, dtype=np.int32)])
+        # 2. component occlusion
+        block_2, mask_occlude = self._occlude_components(block_2, pc_full_vox, comps_full)
+        if mask_occlude is not None:
+            labels_2 = labels_2[~mask_occlude]
+            ids_2 = ids_2[~mask_occlude]
+
+        # 3. attenuation by range
+        if np.random.rand() < 0.7:
+            keep_mask = self._attenuate_by_range(block_2)
+            block_2 = block_2[keep_mask]
+            labels_2 = labels_2[keep_mask]
+            ids_2 = ids_2[keep_mask]
+
+        # 4. scatter noise
+        if np.random.rand() < 0.5:
+            block_2, labels_2, ids_2 = self._scatter_noise(block_2, labels_2, ids_2)
 
         # 5. random dropout
         if np.random.rand() < 0.5:
@@ -319,38 +315,45 @@ class SemanticLearnerKITTIInternal:
             idxes = np.random.choice(block_2.shape[0], int(ratio * block_2.shape[0]), replace=False)
             block_2 = block_2[idxes]
             labels_2 = labels_2[idxes]
-            ids_2_full = ids_2_full[idxes]
-            correspond_idx = correspond_idx[idxes]
+            ids_2 = ids_2[idxes]
 
         # 6. rotation, scaling, flip, jitter
         theta = np.random.uniform(0, 2 * np.pi)
-        scale_factor = np.random.uniform(0.95, 1.05)
+        scale = np.random.uniform(0.95, 1.05)
         rot_mat = np.array([[np.cos(theta), np.sin(theta), 0],
                             [-np.sin(theta), np.cos(theta), 0],
                             [0, 0, 1]])
-        block_2[:, :3] = block_2[:, :3] @ rot_mat.T * scale_factor
+        block_2[:, :3] = block_2[:, :3] @ rot_mat.T * scale
         if np.random.rand() < 0.5: block_2[:, 0] *= -1
         if np.random.rand() < 0.5: block_2[:, 1] *= -1
         if np.random.rand() < 0.5:
             jitter = np.clip(np.random.normal(0, 0.01, size=(block_2.shape[0], 3)), -0.05, 0.05)
             block_2[:, :3] += jitter
 
-        # 7. voxelization & sparse tensor
+        # 7. voxelization & 固定采样
         feat_2_ = block_2
         pc_2_ = np.round(block_2[:, :3] / self.voxel_size).astype(np.int32)
         pc_2_ -= pc_2_.min(0, keepdims=1)
         _, inds_2, _ = sparse_quantize(pc_2_, return_index=True, return_inverse=True)
-        ratio = np.random.rand() * 0.2 + 0.8
-        if len(inds_2) > int(self.num_points * ratio):
-            inds_2 = np.random.choice(inds_2, int(self.num_points * ratio), replace=False)
+
+        if len(inds_2) > self.num_points:
+            inds_2 = np.random.choice(inds_2, self.num_points, replace=False)
+        elif len(inds_2) < self.num_points:
+            inds_2 = np.random.choice(inds_2, self.num_points, replace=True)
+
         pc_2 = pc_2_[inds_2]
-        labels_2 = labels_2[inds_2]
         feat_2 = feat_2_[inds_2]
-        ids_2 = ids_2_full[inds_2]
+        labels_2 = labels_2[inds_2]
+        ids_2 = ids_2[inds_2]
+
         lidar_2 = SparseTensor(feat_2, pc_2)
         labels_2 = SparseTensor(labels_2, pc_2)
         ids_2 = SparseTensor(ids_2, pc_2)
-        correspond_idx =correspond_idx
+
+        # 8. compute correspond_idx using KDTree
+        from scipy.spatial import cKDTree
+        tree = cKDTree(block_1[:, :3])
+        _, correspond_idx = tree.query(block_2[:, :3], k=1)
 
         return {
             'lidar': lidar_1,
@@ -361,7 +364,7 @@ class SemanticLearnerKITTIInternal:
             'lidar_2': lidar_2,
             'ids_2': ids_2,
             'targets_2': labels_2,
-            'correspond_idx': correspond_idx
+            # 'correspond_idx': correspond_idx.astype(np.int32)
         }
     @staticmethod
     def collate_fn(inputs):

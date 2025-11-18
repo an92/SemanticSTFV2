@@ -3,8 +3,8 @@
 export PYTHONPATH="${PYTHONPATH}:/home/SemanticSTFV2/"
 export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
 
-config_file='/home/SemanticSTFV2/PointDR/configs/learner_minkunet_1.yaml'
-run_dir='learner_robust'
+config_file='/home/SemanticSTFV2/PointDR/configs/learner_minkunet_3.yaml'
+run_dir='learner_robust_3'
 
 # 设置可见GPU
 #export CUDA_VISIBLE_DEVICES=4,5,6,7
@@ -17,9 +17,9 @@ run_dir='learner_robust'
 ##nohup python PointDR/train_learner_minkunet.py \
 ##      --config "$config_file" \
 ##      --run-dir "$run_dir" > learner_robust.log 2>&1 &
-export CUDA_VISIBLE_DEVICES=5
+export CUDA_VISIBLE_DEVICES=3
 
 nohup python PointDR/train_learner_minkunet.py \
       --config "$config_file" \
       --run-dir "$run_dir" > \
-      learner_1.log 2>&1 &
+      learner_3.log 2>&1 &

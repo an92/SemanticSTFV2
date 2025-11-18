@@ -81,8 +81,8 @@ def main() -> None:
             dataflow[split],
             callbacks=[MeanIoU(name=f'iou/{split}', num_classes=configs.data.num_classes, ignore_label=configs.data.ignore_label)],
         ) for split in ['test']] + [
-            BestEpochSaver('iou/test', filename='best_epoch.pt'),
-            EpochSaver(),
+            BestEpochSaver('iou/test', filename='best_epoch'),
+            EpochSaver(max_to_keep=None),
         ])
 
 

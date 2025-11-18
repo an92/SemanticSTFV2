@@ -4,7 +4,7 @@ model:
   lamda_proto: 0.1
   lamda_cons: 0.05
   lamda_info: 0.05
-  gamma_acp: 3.0
+  gamma_acp: 2.0
 
 
 data:
@@ -17,8 +17,13 @@ train:
   deterministic: False
 
 src_dataset:
-  name: semantickitti   # pointdr原始的数据处理方式  semantickitti semantic_learner
+  name: semantic_learner   # pointdr原始的数据处理方式  semantickitti semantic_learner
   root: /home/dataset/SemanticKITTI/sequences
+  args: {
+          'componentOcclusion': True,
+          'attenuation': True,
+          'scatterNoise': True,
+  }
   num_points: 80000
   voxel_size: 0.05
 

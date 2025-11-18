@@ -156,6 +156,7 @@ class MinkUNet_Learner(nn.Module):
         # ---------------- Adaptive Prototype & Memory Bank ----------------
         self.register_buffer("memo_bank_B", torch.zeros(self.num_classes, 128))
         self.register_buffer("memo_bank_G", torch.zeros(self.num_classes, 128))
+        self.register_buffer("memo_bank", torch.zeros(self.num_classes, 128))
         self.register_buffer("class_counts", torch.zeros(self.num_classes))
 
         # Momentum

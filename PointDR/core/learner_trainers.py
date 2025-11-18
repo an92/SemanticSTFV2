@@ -92,55 +92,63 @@ class MinkUnetLearnerTrainer(Trainer):
         targets = feed_dict['targets'].F.long().cuda(non_blocking=True)
 
         with amp.autocast(enabled=self.amp_enabled):
-            # Forward pass
+            # ---------------- Forward pass ----------------
             outputs, feat = self.model(inputs)
             loss_ce = self.criterion(outputs, targets) if outputs.requires_grad else None
 
         if outputs.requires_grad:
             # ---------------- Data Augmentation / Feature Consistency ----------------
             inputs_aug = _inputs.get('lidar_2', None)
-            correspond_idx = feed_dict.get('correspond_idx', None)
-
-            if inputs_aug is not None and correspond_idx is not None:
+            if inputs_aug is not None:
                 outputs_aug, feat_aug = self.model(inputs_aug)
 
-                valid_mask = correspond_idx >= 0
-                feat_norm_kept = feat[correspond_idx[valid_mask]].detach()
-                feat_aug_kept = feat_aug[valid_mask]
+                # KDTree correspondence
+                coords_1 = inputs.C[:, :3].float().cpu().numpy()
+                coords_2 = inputs_aug.C[:, :3].float().cpu().numpy()
+                from scipy.spatial import cKDTree
+                tree = cKDTree(coords_1)
+                _, correspond_idx = tree.query(coords_2, k=1)
+                correspond_idx = torch.from_numpy(correspond_idx).long().cuda()
 
-                targets_kept = targets[correspond_idx[valid_mask]]
-                valid_mask2 = (targets_kept != 255)
+                # Mask: only valid labels
+                targets_aug = feed_dict['targets_2'].F.long().cuda(non_blocking=True)
+                valid_mask = (targets[correspond_idx] != 255) & (targets_aug != 255)
 
+                # FP16 / dtype safe
                 loss_consistency = nn.functional.mse_loss(
-                    feat_aug_kept[valid_mask2],
-                    feat_norm_kept[valid_mask2]
+                    feat_aug[valid_mask].to(outputs.dtype),
+                    feat.detach()[correspond_idx[valid_mask]].to(outputs.dtype)
                 )
             else:
-                loss_consistency = torch.zeros(1, device=feat.device)  # <-- 你的代码中可能漏掉了这行
+                loss_consistency = torch.zeros(1, device=feat.device, dtype=outputs.dtype)
 
             # ---------------- Adaptive Class-aware Prototype ----------------
-            feat_proto, class_counts = self.compute_prototype(nn.functional.normalize(feat, dim=1), targets)
-            self.model.momentum_update_B(feat_proto, init=(self.global_step == 1))
-            P_adaptive_T, avg_alpha = self.model.get_adaptive_prototype(targets, class_counts)
             feat_norm = nn.functional.normalize(feat, dim=1)
-            P_adaptive_T = P_adaptive_T.to(feat_norm.dtype)  # <- 关键
-            logits_proto = torch.mm(feat_norm, P_adaptive_T) / self.T
-            mask = (targets != 255)
-            loss_proto = self.criterion(logits_proto[mask], targets[mask])
+            feat_proto, class_counts = self.compute_prototype(feat_norm, targets)
+            self.model.momentum_update_B(feat_proto, init=(self.global_step == 1))
+            self.model.momentum_update_G(feat_proto, init=(self.global_step == 1))
+            P_adaptive_T, avg_alpha = self.model.get_adaptive_prototype(targets, class_counts)
+
+            logits_proto = torch.mm(feat_norm.to(P_adaptive_T.dtype), P_adaptive_T) / self.T
+            mask_proto = (targets != 255)
+            loss_proto = self.criterion(logits_proto[mask_proto], targets[mask_proto])
 
             # ---------------- Point-wise infoNCE / memory bank ----------------
             if hasattr(self.model, 'memo_bank'):
-                # Normalize features
                 feat_norm = nn.functional.normalize(feat, dim=1)
-                logits_info = torch.mm(feat_norm, self.model.memo_bank.T.detach()) / self.T
-                loss_info = self.criterion(logits_info[mask], targets[mask])
+                memo_bank_T_matched = self.model.memo_bank.T.detach().to(feat_norm.dtype)
+                logits_info = torch.mm(feat_norm, memo_bank_T_matched) / self.T
+                mask_info = (targets != 255)
+                loss_info = self.criterion(logits_info[mask_info], targets[mask_info])
                 # Momentum update memory bank
-                self.model.momentum_update_key_encoder(feat_proto, init=(self.global_step==1))
+                self.model.momentum_update_key_encoder(feat_proto, init=(self.global_step == 1))
             else:
-                loss_info = torch.zeros(1, device=feat.device)
+                loss_info = torch.zeros(1, device=feat.device, dtype=outputs.dtype)
 
             # ---------------- Total Loss ----------------
             loss = loss_ce + self.lamda_proto * loss_proto + self.lamda_cons * loss_consistency + self.lamda_info * loss_info
+
+            # Summary
             self.summary.add_scalar('loss', loss.item())
             self.summary.add_scalar('loss_ce', loss_ce.item())
             self.summary.add_scalar('loss_proto', loss_proto.item())
@@ -148,12 +156,13 @@ class MinkUnetLearnerTrainer(Trainer):
             self.summary.add_scalar('loss_info', loss_info.item())
             self.summary.add_scalar('AC_Prototype/avg_alpha', avg_alpha)
 
-            # Backpropagation
+            # ---------------- Backprop ----------------
             self.optimizer.zero_grad()
             self.scaler.scale(loss).backward()
             self.scaler.step(self.optimizer)
             self.scaler.update()
             self.scheduler.step()
+
             return {'outputs': outputs, 'targets': targets}
 
         # ---------------- Inference / Mapping ----------------

@@ -5,7 +5,6 @@ import numpy as np
 from torchsparse import SparseTensor
 from torchsparse.utils.collate import sparse_collate_fn
 from torchsparse.utils.quantize import sparse_quantize
-from torchpack.utils.logging import logger
 
 __all__ = ['SingleAugSemanticKITTI']
 
@@ -15,7 +14,6 @@ from PointDR.core.datasets.transform_3d import apply_rotate_scale, \
     apply_flip_axis, apply_intensity_channel_distortion, apply_physical_attenuation_model, \
     apply_selective_range_jittering, apply_weather_layered_augmentation, apply_geometry_selective_jitter, \
     apply_distance_biased_point_drop, apply_intensity_jitter,  apply_occlusion_patch
-
 
 
 AUG_MAP = {

@@ -5,7 +5,7 @@ export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
 
 
 # 设置可见GPU
-export CUDA_VISIBLE_DEVICES=3
+export CUDA_VISIBLE_DEVICES=7
 
 #export NCCL_P2P_DISABLE=1
 #export NCCL_IB_DISABLE=1

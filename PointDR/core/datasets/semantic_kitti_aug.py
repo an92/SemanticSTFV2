@@ -12,7 +12,8 @@ __all__ = ['AugSemanticKITTI']
 from PointDR.core.datasets.transform_3d import apply_rotate_scale, \
     apply_random_jittering, apply_random_drop_out, apply_add_noise_points, \
     apply_flip_axis, apply_intensity_channel_distortion, apply_selective_range_jittering, \
-    apply_physical_attenuation_model
+    apply_physical_attenuation_model, apply_distance_biased_point_drop, apply_weather_layered_augmentation, \
+    apply_geometry_selective_jitter, apply_intensity_jitter, apply_occlusion_patch
 
 label_name_mapping = {
     0: 'unlabeled',
@@ -65,6 +66,11 @@ AUG_MAP = {
     'intensity_channel_distortion': apply_intensity_channel_distortion,
     'physical_attenuation_model': apply_physical_attenuation_model,
     'selective_range_jittering': apply_selective_range_jittering,
+    'weather_layered_augmentation': apply_weather_layered_augmentation,
+    'geometry_selective_jitter': apply_geometry_selective_jitter,
+    'distance_biased_point_drop': apply_distance_biased_point_drop,
+    'intensity_jitter': apply_intensity_jitter,
+    'occlusion_patch': apply_occlusion_patch,
 }
 
 class AugmentationPipeline:
