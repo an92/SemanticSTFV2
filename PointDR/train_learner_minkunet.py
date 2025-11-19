@@ -79,9 +79,9 @@ def main() -> None:
         num_workers=configs.workers_per_gpu,
         seed=seed,
         amp_enabled=configs.amp_enabled,
-        lamda_proto=configs.model.lamda_proto,
-        lamda_cons=configs.model.lamda_cons,
-        lamda_info=configs.model.lamda_info,
+        thing_weight= configs.model.thing_weight,
+        mu= configs.model.mu,
+        lam= configs.model.lam,
     )
 
     trainer.train_with_defaults(dataflow['train'],

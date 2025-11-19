@@ -38,9 +38,9 @@ class MinkUnetLearnerTrainer(Trainer):
                  num_workers: int,
                  seed: int,
                  amp_enabled: bool = False,
-                 lamda_proto: float = 0.1,
-                 lamda_cons: float = 0.05,
-                 lamda_info: float = 0.05,
+                 thing_weight: float = 2.0,
+                 mu: float = 0.001,
+                 lam: float =0.1,
                 ):
         self.model = model
         self.criterion = criterion
@@ -52,28 +52,13 @@ class MinkUnetLearnerTrainer(Trainer):
         self.scaler = amp.GradScaler(enabled=self.amp_enabled)
         self.epoch_num = 1
 
-        # Loss weights
-        self.lamda_proto = lamda_proto
-        self.lamda_cons = lamda_cons
-        self.lamda_info = lamda_info
+
         self.T = 0.07
 
-    # ---------------- Helper ----------------
-    def compute_prototype(self, feat: torch.Tensor, targets: torch.Tensor):
-        """Compute normalized class-wise prototypes."""
-        feat = nn.functional.normalize(feat, dim=1)
-        num_classes = configs.data.num_classes
-        feat_proto = torch.zeros((num_classes, feat.shape[1]), device=feat.device)
-        class_counts = torch.zeros(num_classes, device=feat.device)
+        self.thing_weight = thing_weight  # NTN: Weight multiplier for safety-critical (things) classes
+        self.mu = mu
+        self.lamda = lam
 
-        for ii in range(num_classes):
-            mask = (targets == ii)
-            if mask.sum():
-                feat_proto[ii] = feat[mask].mean(dim=0)
-                class_counts[ii] = mask.sum()
-
-        feat_proto[class_counts > 0] = nn.functional.normalize(feat_proto[class_counts > 0], dim=1)
-        return (feat_proto + 1e-8), class_counts
 
     def _before_epoch(self) -> None:
         self.model.train()
@@ -86,100 +71,103 @@ class MinkUnetLearnerTrainer(Trainer):
         self.model.eval()
 
     def _run_step(self, feed_dict: Dict[str, Any]) -> Dict[str, Any]:
-        # ---------------- Prepare Inputs ----------------
-        _inputs = {k: v.cuda() for k, v in feed_dict.items() if 'name' not in k and 'ids' not in k}
-        inputs = _inputs['lidar']
-        targets = feed_dict['targets'].F.long().cuda(non_blocking=True)
+        _inputs = {}
+        for key, value in feed_dict.items():
+            if 'name' not in key and 'ids' not in key:
+                _inputs[key] = value.cuda()
 
+        inputs_1 = _inputs['lidar']
+        targets_1 = feed_dict['targets'].F.long().cuda(non_blocking=True)
         with amp.autocast(enabled=self.amp_enabled):
-            # ---------------- Forward pass ----------------
-            outputs, feat = self.model(inputs)
-            loss_ce = self.criterion(outputs, targets) if outputs.requires_grad else None
+            outputs_1, feat_1 = self.model(inputs_1)
+            if outputs_1.requires_grad:
+                loss_1 = self.criterion(outputs_1, targets_1)
 
-        if outputs.requires_grad:
-            # ---------------- Data Augmentation / Feature Consistency ----------------
-            inputs_aug = _inputs.get('lidar_2', None)
-            if inputs_aug is not None:
-                outputs_aug, feat_aug = self.model(inputs_aug)
+        if outputs_1.requires_grad:
+            # consistency loss
+            inputs_2 = _inputs['lidar_2']
+            targets_2 = feed_dict['targets_2'].F.long().cuda(non_blocking=True)
+            pred_2, feat_2 = self.model(inputs_2)
+            # ---- point-wise infoNCE loss -----
+            # step 1: get mean feature (prototypes) for each class in weak view
+            feat_1 = nn.functional.normalize(feat_1, dim=1)
+            feat_2 = nn.functional.normalize(feat_2, dim=1)
+            feat1_proto = torch.zeros((configs.data.num_classes, feat_1.shape[1]))
+            for ii in range(configs.data.num_classes):
+                mask = (targets_1 == ii)
+                if mask.sum():
+                    feat1_proto[ii] = feat_1[mask].mean(dim=0)
+            feat1_proto = (feat1_proto + 1e-8).cuda()
+            # step 2: get similarity
+            logits = torch.mm(feat_2, self.model.memo_bank.T.detach())
+            logits /= self.T  # apply temperature
 
-                # KDTree correspondence
-                coords_1 = inputs.C[:, :3].float().cpu().numpy()
-                coords_2 = inputs_aug.C[:, :3].float().cpu().numpy()
-                from scipy.spatial import cKDTree
-                tree = cKDTree(coords_1)
-                _, correspond_idx = tree.query(coords_2, k=1)
-                correspond_idx = torch.from_numpy(correspond_idx).long().cuda()
+            # --- MODIFICATION 1: NTN-inspired Class Weighting for Contrastive Loss (loss_2) ---
+            # Safety-critical classes (SemanticKITTI things classes: car, person, cyclist, etc.)
+            # IDs: [0-7, 13, 17, 18]
+            things_class_ids = torch.tensor([0, 1, 2, 3, 4, 5, 6, 7, 13, 17, 18], device=targets_2.device)
+            class_weights_tensor = torch.ones(configs.data.num_classes, device=targets_2.device)
+            # Apply higher weight to 'things' classes
+            for cls_id in things_class_ids:
+                if cls_id < configs.data.num_classes:
+                    class_weights_tensor[cls_id] = self.thing_weight
 
-                # Mask: only valid labels
-                targets_aug = feed_dict['targets_2'].F.long().cuda(non_blocking=True)
-                valid_mask = (targets[correspond_idx] != 255) & (targets_aug != 255)
+                    # Create a weighted CrossEntropyLoss for the contrastive head (loss_2)
+            # NOTE: Assumes self.criterion is not an instance of nn.CrossEntropyLoss or similar
+            criterion_weighted = nn.CrossEntropyLoss(
+                weight=class_weights_tensor,
+                ignore_index=255,
+                reduction='mean'
+            ).cuda()
 
-                # FP16 / dtype safe
-                loss_consistency = nn.functional.mse_loss(
-                    feat_aug[valid_mask].to(outputs.dtype),
-                    feat.detach()[correspond_idx[valid_mask]].to(outputs.dtype)
-                )
-            else:
-                loss_consistency = torch.zeros(1, device=feat.device, dtype=outputs.dtype)
+            loss_2 = criterion_weighted(logits, targets_2)
 
-            # ---------------- Adaptive Class-aware Prototype ----------------
-            feat_norm = nn.functional.normalize(feat, dim=1)
-            feat_proto, class_counts = self.compute_prototype(feat_norm, targets)
-            self.model.momentum_update_B(feat_proto, init=(self.global_step == 1))
-            self.model.momentum_update_G(feat_proto, init=(self.global_step == 1))
-            P_adaptive_T, avg_alpha = self.model.get_adaptive_prototype(targets, class_counts)
 
-            logits_proto = torch.mm(feat_norm.to(P_adaptive_T.dtype), P_adaptive_T) / self.T
-            mask_proto = (targets != 255)
-            loss_proto = self.criterion(logits_proto[mask_proto], targets[mask_proto])
+            # momentum update memory bank
+            self.model.momentum_update_key_encoder(feat1_proto, init=(self.global_step==1))
 
-            # ---------------- Point-wise infoNCE / memory bank ----------------
-            if hasattr(self.model, 'memo_bank'):
-                feat_norm = nn.functional.normalize(feat, dim=1)
-                memo_bank_T_matched = self.model.memo_bank.T.detach().to(feat_norm.dtype)
-                logits_info = torch.mm(feat_norm, memo_bank_T_matched) / self.T
-                mask_info = (targets != 255)
-                loss_info = self.criterion(logits_info[mask_info], targets[mask_info])
-                # Momentum update memory bank
-                self.model.momentum_update_key_encoder(feat_proto, init=(self.global_step == 1))
-            else:
-                loss_info = torch.zeros(1, device=feat.device, dtype=outputs.dtype)
+            # --- MODIFICATION 2: DGUIL-inspired Entropy Regularization (loss_3) ---
+            # Minimize the entropy of the perturbed view's prediction (pred_2)
+            softmax_pred_2 = torch.softmax(pred_2, dim=1)
+            # Entropy = - sum(p * log(p))
+            # Use a small constant (1e-6) for numerical stability
+            entropy = (softmax_pred_2 * torch.log(softmax_pred_2 + 1e-6)).sum(dim=1)
+            # Mask out ignore label (255) points
+            valid_mask = (targets_2 != 255)
+            # Only consider the uncertainty of valid points
+            loss_3 = -entropy[valid_mask].mean()
 
-            # ---------------- Total Loss ----------------
-            loss = loss_ce + self.lamda_proto * loss_proto + self.lamda_cons * loss_consistency + self.lamda_info * loss_info
+            loss = loss_1 + self.lamda * loss_2 + self.mu * loss_3
+            # ----------------------------------------------
 
-            # Summary
+
             self.summary.add_scalar('loss', loss.item())
-            self.summary.add_scalar('loss_ce', loss_ce.item())
-            self.summary.add_scalar('loss_proto', loss_proto.item())
-            self.summary.add_scalar('loss_consistency', loss_consistency.item())
-            self.summary.add_scalar('loss_info', loss_info.item())
-            self.summary.add_scalar('AC_Prototype/avg_alpha', avg_alpha)
+            self.summary.add_scalar('loss_1', loss_1.item())
+            self.summary.add_scalar('loss_2', loss_2.item())
+            self.summary.add_scalar('loss_3', loss_3.item())
 
-            # ---------------- Backprop ----------------
             self.optimizer.zero_grad()
             self.scaler.scale(loss).backward()
             self.scaler.step(self.optimizer)
             self.scaler.update()
             self.scheduler.step()
-
-            return {'outputs': outputs, 'targets': targets}
-
-        # ---------------- Inference / Mapping ----------------
+            return {'outputs': outputs_1, 'targets': targets_1}
         else:
             invs = feed_dict['inverse_map']
             all_labels = feed_dict['targets_mapped']
-            _outputs, _targets = [], []
+            _outputs = []
+            _targets = []
             for idx in range(invs.C[:, -1].max() + 1):
-                cur_scene_pts = (inputs.C[:, -1] == idx).cpu().numpy()
+                cur_scene_pts = (inputs_1.C[:, -1] == idx).cpu().numpy()
                 cur_inv = invs.F[invs.C[:, -1] == idx].cpu().numpy()
                 cur_label = (all_labels.C[:, -1] == idx).cpu().numpy()
-                outputs_mapped = outputs[cur_scene_pts][cur_inv].argmax(1)
+                outputs_mapped = outputs_1[cur_scene_pts][cur_inv].argmax(1)
                 targets_mapped = all_labels.F[cur_label]
                 _outputs.append(outputs_mapped)
                 _targets.append(targets_mapped)
             outputs = torch.cat(_outputs, 0)
             targets = torch.cat(_targets, 0)
+
             return {'outputs': outputs, 'targets': targets}
 
     # ---------------- State Dict ----------------

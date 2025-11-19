@@ -2,7 +2,7 @@ import os
 import argparse
 import numpy as np
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
 import torch
 import torch.backends.cudnn
@@ -69,11 +69,11 @@ def main() -> None:
     torch.cuda.set_device(dist.local_rank())
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('--config', default="/home/SemanticSTFV2/PointDR/configs/base_pointdr.yaml",
+    parser.add_argument('--config', default="/home/SemanticSTFV2/PointDR/configs/aug_minkunet.yaml",
                         help='config file')
-    parser.add_argument('--checkpoint_path', default="/home/SemanticSTFV2/runs/pointdr_62398157/checkpoints/best_epoch.pt",
+    parser.add_argument('--checkpoint_path', default="/home/SemanticSTFV2/runs/aug_minkunet_63458707/checkpoints/best_epoch.pt",
                         help='checkpoint_path')
-    parser.add_argument('--name', type=str, default='minkunet_dr', help='model name')
+    parser.add_argument('--name', type=str, default='minkunet', help='model name')
     parser.add_argument('--save_pred', type=str, default=None, help='save prediction dir, do not save if none')
     args, opts = parser.parse_known_args()
 

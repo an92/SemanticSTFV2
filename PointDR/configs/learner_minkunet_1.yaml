@@ -1,10 +1,9 @@
 model:
-  name: minkunet_learner
+  name: minkunet_dr
   cr: 0.5
-  lamda_proto: 0.08
-  lamda_cons: 0.05
-  lamda_info: 0.03
-  gamma_acp: 2.0
+  thing_weight: 3.0
+  mu: 0.001
+  lam: 0.2
 
 
 data:
@@ -17,19 +16,14 @@ train:
   deterministic: False
 
 src_dataset:
-  name: semantic_learner   # pointdr原始的数据处理方式  semantickitti semantic_learner
+  name: semantickitti   # pointdr原始的数据处理方式
   root: /home/dataset/SemanticKITTI/sequences
-  args: {
-          'componentOcclusion': True,
-          'attenuation': True,
-          'scatterNoise': True,
-  }
   num_points: 80000
   voxel_size: 0.05
 
 tgt_dataset:
-  name: semanticstf
-  root: /home/dataset/SemanticSTF
+  name: semantickitti
+  root: /home/dataset/SemanticKITTI/sequences
   num_points: 80000
   voxel_size: 0.05
 
@@ -42,14 +36,13 @@ criterion:
 
 optimizer:
   name: sgd
-  lr: 0.12
+  lr: 2.4e-1
   weight_decay: 1.0e-4
   momentum: 0.9
   nesterov: true
 
 scheduler:
   name: cosine_warmup
-
 
 workers_per_gpu: 8
 distributed: False
