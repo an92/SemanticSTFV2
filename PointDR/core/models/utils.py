@@ -2,6 +2,7 @@ import torch
 import torchsparse.nn.functional as F
 from torchsparse import PointTensor, SparseTensor
 from torchsparse.nn.utils import get_kernel_offsets
+import torch.nn as nn
 
 __all__ = ['initial_voxelize', 'point_to_voxel', 'voxel_to_point']
 
@@ -98,3 +99,51 @@ def voxel_to_point(x, z, nearest=False):
         new_tensor.additional_features = z.additional_features
 
     return new_tensor
+
+
+class PAMix(nn.Module):
+    """
+    Physics-aware MixStyle for point cloud features.
+    使用物理天气参数控制特征风格混合
+    """
+
+    def __init__(self, eps=1e-6):
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, feat: torch.Tensor, weather_param: dict):
+        """
+        feat: SparseTensor 或 (B, C, N) 中间特征
+        weather_param: dict, 如 {'fog_alpha': 0.7, 'drop_rate':0.3, 'intensity_scale':0.6}
+        """
+
+        # 如果是 SparseTensor
+        if hasattr(feat, 'F'):
+            x = feat.F
+        else:
+            x = feat  # 假设 (B, C, N)
+
+        # 计算特征均值和方差
+        mu = x.mean(dim=0, keepdim=True)
+        sigma = x.std(dim=0, keepdim=True) + self.eps
+
+        # 根据天气参数生成 λ（简单示例）
+        lam = torch.tensor([
+            weather_param.get('fog_alpha', 0.0),
+            weather_param.get('drop_rate', 0.0),
+            weather_param.get('intensity_scale', 0.0)
+        ]).mean().item()  # 这里用平均值作为控制因子
+
+        # 生成 weather-aware 均值/方差
+        mu_weather = mu * lam
+        sigma_weather = sigma * lam
+
+        # PAMix 风格混合
+        x_new = sigma_weather * (x - mu) / sigma + mu_weather
+
+        # 如果是 SparseTensor，写回 F
+        if hasattr(feat, 'F'):
+            feat.F = x_new
+            return feat
+        else:
+            return x_new

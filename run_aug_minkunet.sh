@@ -3,6 +3,9 @@
 export PYTHONPATH="${PYTHONPATH}:/home/SemanticSTFV2/"
 export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
 
+config_file='/home/SemanticSTFV2/PointDR/configs/aug_minkunet_1.yaml'
+run_dir='aug_minkunet_robust'
+
 
 # 设置可见GPU
 export CUDA_VISIBLE_DEVICES=7
@@ -11,6 +14,9 @@ export CUDA_VISIBLE_DEVICES=7
 #export NCCL_IB_DISABLE=1
 #nohup torchrun --nproc_per_node=2 --master_port=29999 PointDR/train_aug.py > aug_pointdr.log 2>&1 &
 
+nohup python PointDR/train_aug_minkunet.py \
+      --config "$config_file" \
+      --run-dir "$run_dir" > aug_minkunet_1.log 2>&1 &
 
-nohup python PointDR/train_aug_minkunet.py > aug_minkunet.log 2>&1 &
+
 
