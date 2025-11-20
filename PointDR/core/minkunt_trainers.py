@@ -187,7 +187,7 @@ def evaluate(val_loader, model):
                     _inputs[key] = value.cuda()
             inputs = _inputs['lidar']
             # targets = feed_dict['targets'].F.long().cuda(non_blocking=True)
-            outputs = model(inputs)
+            outputs, _ = model(inputs)
 
             invs = feed_dict['inverse_map']
             all_labels = feed_dict['targets_mapped']
