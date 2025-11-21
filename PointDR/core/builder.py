@@ -121,6 +121,20 @@ def make_model() -> nn.Module:
         else:
             cr = 1.0
         model = MinkUNet_Robust(num_classes=configs.data.num_classes, cr=cr)
+    elif configs.model.name == 'minkunet_pamix':
+        from core.models.semantic_kitti import MinkUNet_PAMix
+        if 'cr' in configs.model:
+            cr = configs.model.cr
+        else:
+            cr = 1.0
+        model = MinkUNet_PAMix(num_classes=configs.data.num_classes, cr=cr)
+    elif configs.model.name == 'minkunet_v1':
+        from core.models.semantic_kitti import MinkUNetV1
+        if 'cr' in configs.model:
+            cr = configs.model.cr
+        else:
+            cr = 1.0
+        model = MinkUNetV1(num_classes=configs.data.num_classes, cr=cr)
     elif configs.model.name == 'minkunet_learner':
         from core.models.semantic_kitti import MinkUNet_Learner
         if 'cr' in configs.model:
