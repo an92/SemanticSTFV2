@@ -4,29 +4,19 @@ data:
   training_size: 19132
 
 model:
-  name: minkunet_v1
+  name: minkunet_v2
   cr: 0.5
-  lambda_ortho: 0.15
-  lambda_weather: 1.0
+  lambda_proto: 10
 
 train:
   seed: 1588147245
   deterministic: False
 
 src_dataset:
-  name: semanticAugkitti
+  name: semanticAugSinglekitti
   root: /home/dataset/SemanticKITTI/sequences
   num_points: 80000
   voxel_size: 0.05
-
-  # --- Weak Aug 流程 ---
-  weak_aug:
-    - name: rotate_scale         # 旋转和缩放
-      prob: 1.0
-      min_angle: 0.0
-      max_angle: 6.283185 # 2 * pi
-      min_scale: 0.95
-      max_scale: 1.05
 
   # --- 定义 Aug 流程---
   strong_aug:
@@ -72,7 +62,7 @@ src_dataset:
       r_scale: 60.0
       gamma: 0.3
       density_voxel_size: 2.0
-      protect_small_classes: [0,1,2,3,4,5,6,7,13,17,18]
+      protect_small_classes: [0,1,2,3,4,5,6,7, 13, 17, 18 ]
       protect_scale: 0.5
 
     - name: occlusion_patch
@@ -80,19 +70,19 @@ src_dataset:
       patch_size: 2.0
       prob: 0.1
 
-tgt_dataset:
-  name: semantickitti
-  root: /home/dataset/SemanticKITTI/sequences
-  num_points: 80000
-  voxel_size: 0.05
-
 #tgt_dataset:
-#  name: semanticstf
-#  root: /home/dataset/SemanticSTF
+#  name: semantickitti
+#  root: /home/dataset/SemanticKITTI/sequences
 #  num_points: 80000
 #  voxel_size: 0.05
 
-num_epochs: 50
+tgt_dataset:
+  name: semanticstf
+  root: /home/dataset/SemanticSTF
+  num_points: 80000
+  voxel_size: 0.05
+
+num_epochs: 30
 batch_size: 8
 
 criterion:

@@ -582,3 +582,161 @@ def apply_occlusion_patch(block: np.ndarray, labels: np.ndarray, ids: np.ndarray
     ids_out = ids[keep_mask] if ids is not None else ids
     return block_out, labels_out, ids_out
 
+
+import torch
+import torch.nn.functional as F
+import math
+from typing import Dict, Any, Tuple
+
+# 注意：此函数假设输入 'coords', 'features', 'labels', 'logits', 'entropy' 均为 PyTorch Tensor 且已在同一设备上。
+
+things_class_ids = torch.tensor([0, 1, 2, 3, 4, 5, 6, 7, 13, 17, 18], dtype=torch.long)
+
+
+def _compute_voxel_occupancies_tensor(coords: torch.Tensor, voxel_size: float) -> torch.Tensor:
+    """
+    高性能 Tensor-based 计算体素占用密度 (point-wise density count)。
+    输入:
+        coords: (N,3) 浮点坐标
+        voxel_size: float, 体素尺寸
+    输出:
+        point_density: (N,) 每个点对应体素的点数量
+    """
+    device = coords.device
+    N = coords.shape[0]
+
+    # 1. 量化到体素索引
+    voxel_indices = torch.floor(coords / voxel_size).to(torch.int32)  # (N,3)
+
+    # 2. 将体素索引转换成唯一 linear key
+    max_coords = voxel_indices.max(dim=0).values + 1  # 每维度最大值 +1
+    key = voxel_indices[:, 0]
+    key = key * max_coords[1] + voxel_indices[:, 1]
+    key = key * max_coords[2] + voxel_indices[:, 2]  # (N,)
+
+    # 3. 使用 scatter_add 统计每个体素的点数量
+    unique_keys, inverse = torch.unique(key, return_inverse=True)  # inverse: (N,) 指向 unique_keys idx
+    counts = torch.zeros_like(unique_keys, dtype=torch.float, device=device)
+    counts.scatter_add_(0, inverse, torch.ones_like(inverse, dtype=torch.float, device=device))
+
+    # 4. 将统计结果映射回每个点
+    point_density = counts[inverse]  # (N,)
+    return point_density
+
+
+def apply_entropy_guided_point_drop_batch(
+        coords: torch.Tensor,        # (N,4) 最后一列 batch_idx
+        features: torch.Tensor,      # (N,D)
+        labels: torch.Tensor,        # (N,)  或 None
+        config: dict = None,
+        logits: torch.Tensor = None, # (N,C)
+        entropy: torch.Tensor = None # (N,)
+) -> tuple:
+    """
+    支持 batch 的 EGPD（Entropy-Guided Point Drop），返回:
+      coords_out, features_out, labels_out, keep_mask
+
+    - coords: (N,4) 最后一列为 batch_idx（int）
+    - features: (N, D)
+    - labels: (N,) 或 None
+    - logits: (N, C) - 用于计算熵权重（必须与 entropy 一致）
+    - entropy: (N,)  - 若已传入 logits 也可以用 logits 计算 entropy
+
+    返回:
+      coords_out: coords[keep_mask]  (M,4)
+      features_out: features[keep_mask] (M,D)
+      labels_out: labels[keep_mask] (M,) 或 None
+      keep_mask: boolean mask of shape (N,), dtype=torch.bool, device=coords.device
+
+    注意：keep_mask 是布尔 mask（True 表示保留该点），**不是**索引列表。
+    """
+    if config is None:
+        config = {}
+
+    device = coords.device
+    assert coords.dim() == 2 and coords.shape[1] >= 4, "coords must be (N, >=4)"
+    N = coords.shape[0]
+
+    if features is None:
+        raise ValueError("features must be provided")
+    if features.shape[0] != N:
+        raise ValueError("features length must match coords")
+
+    if labels is not None and labels.shape[0] != N:
+        raise ValueError("labels length must match coords")
+
+    # config defaults
+    base_drop = config.get('base_drop', 0.04)
+    max_drop = config.get('max_drop', 0.5)
+    r_scale = config.get('r_scale', 60.0)
+    gamma = config.get('gamma', 0.3)
+    density_voxel = config.get('density_voxel_size', 2.0)
+    protect_small_classes = config.get('protect_small_classes', None)
+    protect_scale = config.get('protect_scale', 0.5)
+
+    # coords 分解
+    coords_xyz = coords[:, :3]
+    batch_idx = coords[:, 3].long()  # (N,)
+
+    # 距离偏置（标量张量）
+    dists = torch.linalg.norm(coords_xyz, dim=1)  # (N,)
+    dist_weight = 1.0 / (1.0 + torch.exp(- (dists / r_scale - 0.5) * 6.0))
+
+    # 密度偏置：调用外部函数 _compute_voxel_occupancies_tensor
+    # 该函数应返回 per-point 的 density 值 (N,)
+    densities = _compute_voxel_occupancies_tensor(coords_xyz, density_voxel)
+    # 防止常数分母
+    densities = (densities - densities.min()) / (densities.max() - densities.min() + 1e-6)
+
+    # 基础丢弃概率
+    drop_prob_base = base_drop + (max_drop - base_drop) * dist_weight
+    drop_prob_base = torch.clamp(drop_prob_base + gamma * (1.0 - densities), 0.0, 1.0)
+
+    # 熵引导权重（如果 entropy 未提供但传入 logits，可计算）
+    if entropy is None:
+        if logits is None:
+            raise ValueError("Either entropy or logits must be provided")
+        num_classes = logits.shape[1]
+        probs = torch.softmax(logits, dim=1)
+        log_probs = torch.log_softmax(logits, dim=1)
+        entropy = -torch.sum(probs * log_probs, dim=1)  # (N,)
+    else:
+        if entropy.shape[0] != N:
+            raise ValueError("entropy length must match coords")
+
+    num_classes = logits.shape[1] if logits is not None else max(2, int(config.get('num_classes', 2)))
+    W_entropy = 1.0 - (entropy / (torch.log(torch.tensor(float(num_classes), device=device)) + 1e-6))
+    W_entropy = torch.clamp(W_entropy, 0.0, 1.0)
+
+    final_drop_prob = drop_prob_base * W_entropy
+    final_drop_prob = torch.clamp(final_drop_prob, 0.0, 1.0)
+
+    # 类别保护（如果需要）
+    if protect_small_classes is not None and labels is not None:
+        # protect_small_classes 可以是 list/tuple/ndarray
+        small_cls_tensor = torch.tensor(list(protect_small_classes), device=device, dtype=labels.dtype)
+        small_mask = torch.isin(labels, small_cls_tensor)
+        final_drop_prob[small_mask] *= float(protect_scale)
+        final_drop_prob = torch.clamp(final_drop_prob, 0.0, 1.0)
+
+    # 随机采样决定保留（布尔 mask）
+    keep_mask = (torch.rand_like(final_drop_prob) > final_drop_prob).to(torch.bool)
+
+    # 如果整个 batch 一个也没保留 -> 为每个场景(每个 batch_idx)至少保留一个点（更稳妥）
+    if keep_mask.sum() == 0:
+        unique_batches = torch.unique(batch_idx)
+        for b in unique_batches:
+            b_idx = (batch_idx == b).nonzero(as_tuple=False).squeeze(1)
+            if b_idx.numel() > 0:
+                sel = b_idx[torch.randint(0, b_idx.numel(), (1,), device=device)]
+                keep_mask[sel] = True
+
+    # 最终保留下来的输出
+    coords_out = coords[keep_mask]
+    features_out = features[keep_mask]
+    labels_out = labels[keep_mask] if labels is not None else None
+
+    # 确保返回 keep_mask 是 torch.bool、device 与输入一致
+    keep_mask = keep_mask.to(device=device, dtype=torch.bool)
+
+    return coords_out, features_out, labels_out, keep_mask
