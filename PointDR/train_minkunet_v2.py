@@ -2,7 +2,7 @@ import argparse
 import random
 import sys
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+# os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
 import numpy as np
 import torch
@@ -86,6 +86,9 @@ def main() -> None:
         seed=seed,
         amp_enabled=configs.amp_enabled,
         lambda_proto=configs.model.lambda_proto,
+        lambda_orth = configs.model.lambda_orth,
+        lambda_style=configs.model.lambda_style,
+        temp_uncertainty=configs.model.temp_uncertainty,
     )
     trainer.train_with_defaults(
         dataflow['train'],

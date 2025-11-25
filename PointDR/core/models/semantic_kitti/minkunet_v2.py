@@ -1,14 +1,14 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.distributed as dist
 import torchsparse
 import torchsparse.nn as spnn
 
-__all__ = ['MinkUNetV2', 'MinkUNetWithPrototype']
+__all__ = ['MinkUNetV2']
 
 
 class BasicConvolutionBlock(nn.Module):
+
     def __init__(self, inc, outc, ks=3, stride=1, dilation=1):
         super().__init__()
         self.net = nn.Sequential(
@@ -23,6 +23,7 @@ class BasicConvolutionBlock(nn.Module):
 
 
 class BasicDeconvolutionBlock(nn.Module):
+
     def __init__(self, inc, outc, ks=3, stride=1):
         super().__init__()
         self.net = nn.Sequential(
@@ -36,6 +37,7 @@ class BasicDeconvolutionBlock(nn.Module):
 
 
 class ResidualBlock(nn.Module):
+
     def __init__(self, inc, outc, ks=3, stride=1, dilation=1):
         super().__init__()
         self.net = nn.Sequential(
@@ -62,6 +64,7 @@ class ResidualBlock(nn.Module):
 
 
 class MinkUNetV2(nn.Module):
+
     def __init__(self, **kwargs):
         super().__init__()
 
@@ -69,16 +72,9 @@ class MinkUNetV2(nn.Module):
         cs = [32, 32, 64, 128, 256, 256, 128, 96, 96]
         cs = [int(cr * x) for x in cs]
         self.run_up = kwargs.get('run_up', True)
-        self.backbone_output_dim = cs[8]  # 记录输出维度供 Wrapper 使用
 
-        self.stem = nn.Sequential(
-            spnn.Conv3d(4, cs[0], kernel_size=3, stride=1),
-            spnn.BatchNorm(cs[0]),
-            spnn.ReLU(True),
-            spnn.Conv3d(cs[0], cs[0], kernel_size=3, stride=1),
-            spnn.BatchNorm(cs[0]),
-            spnn.ReLU(True)
-        )
+        self.stem = nn.Sequential(spnn.Conv3d(4, cs[0], kernel_size=3, stride=1), spnn.BatchNorm(cs[0]), spnn.ReLU(True), spnn.Conv3d(cs[0], cs[0], kernel_size=3, stride=1), spnn.BatchNorm(cs[0]),
+                                  spnn.ReLU(True))
 
         self.stage1 = nn.Sequential(
             BasicConvolutionBlock(cs[0], cs[0], ks=2, stride=2, dilation=1),
@@ -86,11 +82,8 @@ class MinkUNetV2(nn.Module):
             ResidualBlock(cs[1], cs[1], ks=3, stride=1, dilation=1),
         )
 
-        self.stage2 = nn.Sequential(
-            BasicConvolutionBlock(cs[1], cs[1], ks=2, stride=2, dilation=1),
-            ResidualBlock(cs[1], cs[2], ks=3, stride=1, dilation=1),
-            ResidualBlock(cs[2], cs[2], ks=3, stride=1, dilation=1)
-        )
+        self.stage2 = nn.Sequential(BasicConvolutionBlock(cs[1], cs[1], ks=2, stride=2, dilation=1), ResidualBlock(cs[1], cs[2], ks=3, stride=1, dilation=1),
+                                    ResidualBlock(cs[2], cs[2], ks=3, stride=1, dilation=1))
 
         self.stage3 = nn.Sequential(
             BasicConvolutionBlock(cs[2], cs[2], ks=2, stride=2, dilation=1),
@@ -138,14 +131,37 @@ class MinkUNetV2(nn.Module):
 
         self.classifier = nn.Sequential(nn.Linear(cs[8], kwargs['num_classes']))
 
-        self.point_transforms = nn.ModuleList([
-            nn.Sequential(nn.Linear(cs[0], cs[4]), nn.BatchNorm1d(cs[4]), nn.ReLU(True)),
-            nn.Sequential(nn.Linear(cs[4], cs[6]), nn.BatchNorm1d(cs[6]), nn.ReLU(True)),
-            nn.Sequential(nn.Linear(cs[6], cs[8]), nn.BatchNorm1d(cs[8]), nn.ReLU(True))
-        ])
+        self.num_classes = kwargs['num_classes']
+        self.content_dim = kwargs.get('content_dim', 128)
+        self.style_dim = kwargs.get('style_dim', 64)
+        self.tau = kwargs.get('tau', 0.07)
+        self.lambda_repulsion = kwargs.get('lambda_repulsion', 0.7)
+        final_dim = cs[8]
+
+        self.proj_head_c = nn.Sequential(    # Content Head
+            nn.Linear(final_dim, self.content_dim * 2),
+            nn.BatchNorm1d(self.content_dim * 2),
+            nn.ReLU(True),
+            nn.Linear(self.content_dim * 2, self.content_dim),
+        )
+        self.proj_head_s = nn.Sequential(    # Style Head
+            nn.Linear(final_dim, self.content_dim),
+            nn.BatchNorm1d(self.content_dim),
+            nn.ReLU(True),
+        )
+
+        self.aug_classifier = nn.Sequential(
+            nn.Linear(self.content_dim, 64),
+            nn.BatchNorm1d(64),
+            nn.ReLU(True),
+            nn.Linear(64, 2),  # 预测 0 (原始) 或 1 (增强)
+        )
+
+        self.register_buffer("prototypes", torch.zeros(self.num_classes, self.content_dim))
+        self.register_buffer("is_proto_init", torch.zeros(self.num_classes, dtype=torch.bool))
+
 
         self.weight_initialization()
-        self.dropout = nn.Dropout(0.3, True)
 
     def weight_initialization(self):
         for m in self.modules():
@@ -176,96 +192,17 @@ class MinkUNetV2(nn.Module):
         y4 = torchsparse.cat([y4, x0])
         y4 = self.up4[1](y4)
 
-        out = self.classifier(y4.F)
+        raw_feats = y4.F
 
-        return out, y4.F
+        # 分类头
+        logits = self.classifier(y4.F)
 
+        # 2. 特征解耦
+        f_content = self.proj_head_c(raw_feats)
+        f_style = self.proj_head_s(raw_feats)
 
-class MinkUNetWithPrototype(nn.Module):
-    """
-    最终稳定版：包含 Loss/Update 顺序修复和冷启动保护。
-    """
+        f_content = F.normalize(f_content, p=2, dim=1)
 
-    def __init__(self, backbone, feature_dim=48, num_classes=19, momentum=0.99):
-        super().__init__()
-        self.backbone = backbone
-        self.num_classes = num_classes
-        self.momentum = momentum
+        aug_logits = self.aug_classifier(f_style)
 
-        # 保持您的原始维度逻辑 (您已确认没问题)
-        if hasattr(backbone, 'backbone_output_dim'):
-            in_dim = backbone.backbone_output_dim
-        else:
-            in_dim = 48
-
-            # Projection Head
-        self.proj_head = nn.Sequential(
-            nn.Linear(in_dim, in_dim),
-            nn.BatchNorm1d(in_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(in_dim, feature_dim)
-        )
-
-        # Prototypes
-        self.register_buffer("prototypes", torch.randn(num_classes, feature_dim))
-        self.register_buffer("is_proto_init", torch.zeros(num_classes, dtype=torch.bool))
-
-        self.prototypes = F.normalize(self.prototypes, p=2, dim=1)
-
-    def forward(self, x, targets=None):
-        logits, raw_feats = self.backbone(x)
-
-        if not self.training or targets is None:
-            return logits, raw_feats, {}
-
-        embed_feats = self.proj_head(raw_feats)
-        embed_feats = F.normalize(embed_feats, p=2, dim=1)
-
-        mask = targets != 255
-        proto_loss = torch.tensor(0.0, device=logits.device)
-
-        if mask.any():
-            feats_valid = embed_feats[mask]
-            targets_valid = targets[mask]
-
-            # =======================================================
-            # [关键修正] 冷启动保护：只对“已初始化”的类别算 Loss
-            # =======================================================
-            initialized_mask = self.is_proto_init[targets_valid]
-
-            # 只有当存在已初始化的类别时，才计算 Loss
-            if initialized_mask.any():
-                feats_calc = feats_valid[initialized_mask]
-                targets_calc = targets_valid[initialized_mask]
-
-                # 取出旧原型 (Detached)
-                proto_old = self.prototypes[targets_calc].detach()
-
-                # 计算相似度与 Loss (Loss 在 Update 之前计算)
-                sim = (feats_calc * proto_old).sum(dim=1)
-                proto_loss = (1.0 - sim).mean()
-
-            # =======================================================
-            # 更新原型 (Update Prototypes)
-            # =======================================================
-            with torch.no_grad():
-                unique_classes = targets_valid.unique()
-                for cls in unique_classes:
-                    cls_mask = targets_valid == cls
-                    feat_mean = feats_valid[cls_mask].mean(dim=0)
-
-                    if dist.is_initialized():
-                        dist.all_reduce(feat_mean)
-                        feat_mean /= dist.get_world_size()
-
-                    feat_mean = F.normalize(feat_mean, p=2, dim=0)
-
-                    if not self.is_proto_init[cls]:
-                        self.prototypes[cls] = feat_mean
-                        self.is_proto_init[cls] = True
-                    else:
-                        self.prototypes[cls] = self.momentum * self.prototypes[cls] + \
-                                               (1 - self.momentum) * feat_mean
-                        self.prototypes[cls] = F.normalize(self.prototypes[cls], p=2, dim=0)
-
-        return logits, raw_feats, {'proto_loss': proto_loss}
+        return logits, f_content, f_style, aug_logits

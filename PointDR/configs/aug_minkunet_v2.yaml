@@ -6,7 +6,12 @@ data:
 model:
   name: minkunet_v2
   cr: 0.5
-  lambda_proto: 10
+  lambda_repulsion: 0.7
+  lambda_proto: 1.0
+  lambda_orth: 0.01
+  lambda_style: 0.001
+  temp_uncertainty: 0.7
+
 
 train:
   seed: 1588147245

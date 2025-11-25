@@ -136,20 +136,12 @@ def make_model() -> nn.Module:
             cr = 1.0
         model = MinkUNetV1(num_classes=configs.data.num_classes, cr=cr)
     elif configs.model.name == 'minkunet_v2':
-        from core.models.semantic_kitti import MinkUNetV2, MinkUNetWithPrototype
+        from core.models.semantic_kitti import MinkUNetV2
         if 'cr' in configs.model:
             cr = configs.model.cr
         else:
             cr = 1.0
-        backbone = MinkUNetV2(num_classes=configs.data.num_classes, cr=cr)
-        feature_dim = configs.model.get('feature_dim', 48)
-        momentum = configs.model.get('proto_momentum', 0.99)
-        model = MinkUNetWithPrototype(
-            backbone=backbone,
-            feature_dim=feature_dim,
-            num_classes=configs.data.num_classes,
-            momentum=momentum
-        )
+        model = MinkUNetV2(num_classes=configs.data.num_classes, cr=cr, lambda_repulsion=configs.model.lambda_repulsion)
 
     elif configs.model.name == 'minkunet_learner':
         from core.models.semantic_kitti import MinkUNet_Learner
