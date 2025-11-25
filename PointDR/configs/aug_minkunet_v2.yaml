@@ -6,11 +6,13 @@ data:
 model:
   name: minkunet_v2
   cr: 0.5
-  lambda_repulsion: 0.7
-  lambda_proto: 1.0
-  lambda_orth: 0.01
-  lambda_style: 0.001
-  temp_uncertainty: 0.7
+  lambda_repulsion: 0.0  # 排斥项， 移除
+  lambda_proto: 0.0  # 移除
+  lambda_orth: 0.01  # 强制 Content Feature和 Style Feature互相正交，确保它们捕捉的信息不重叠。
+  lambda_style: 0.001   # 对 Style施加 L2 正则化约束，防止其特征值变得过大或过于复杂，有助于整体训练稳定。
+  temp_uncertainty: 0.7  # 控制不确定性加权的敏感度。它确保模型主要关注那些它相对确定的点（即不让模型被大量高不确定性的噪声点带偏）。
+  disentangle_start_epoch: 5  # Warm-up 机制， 在训练初期（前 5 个 Epoch）只使用Lce
+  lambda_aug: 1.0   # 风格监督信号。 强制 Style施加学习到增强信息（即域信息）。
 
 
 train:

@@ -145,9 +145,10 @@ class MinkUNetV2(nn.Module):
             nn.Linear(self.content_dim * 2, self.content_dim),
         )
         self.proj_head_s = nn.Sequential(    # Style Head
-            nn.Linear(final_dim, self.content_dim),
-            nn.BatchNorm1d(self.content_dim),
+            nn.Linear(final_dim, self.content_dim * 2),
+            nn.BatchNorm1d(self.content_dim * 2),
             nn.ReLU(True),
+            nn.Linear(self.content_dim * 2, self.content_dim),
         )
 
         self.aug_classifier = nn.Sequential(

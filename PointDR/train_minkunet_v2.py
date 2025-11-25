@@ -89,6 +89,8 @@ def main() -> None:
         lambda_orth = configs.model.lambda_orth,
         lambda_style=configs.model.lambda_style,
         temp_uncertainty=configs.model.temp_uncertainty,
+        disentangle_start_epoch = configs.model.disentangle_start_epoch,
+        lambda_aug = configs.model.lambda_aug,
     )
     trainer.train_with_defaults(
         dataflow['train'],

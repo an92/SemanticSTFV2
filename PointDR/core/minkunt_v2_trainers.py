@@ -42,10 +42,12 @@ class MinkUnetV2Trainer(Trainer):
         num_workers: int,
         seed: int,
         amp_enabled: bool = False,
-        lambda_proto: float = 100.0,
+        lambda_proto: float = 0.0,
         lambda_orth: float = 0.1,
         lambda_style: float = 0.01,
         temp_uncertainty: float = 0.5,
+        disentangle_start_epoch: int=5,
+        lambda_aug: float=1.0,
     ) -> None:
         self.model = model
         self.criterion = criterion
@@ -64,91 +66,18 @@ class MinkUnetV2Trainer(Trainer):
         self.lambda_style = lambda_style
         self.temp_uncertainty = temp_uncertainty
         self.ignore_label = 255
+        self.disentangle_start_epoch =disentangle_start_epoch
+        self.lambda_aug = lambda_aug
 
         self.criterion_reduction_none = nn.CrossEntropyLoss(ignore_index=self.ignore_label, reduction='none')
 
     @torch.no_grad()
     def _update_prototypes(self, feats, targets, model, momentum=0.99):
-
-        device = feats.device
-        num_classes, feat_dim = model.prototypes.shape
-        momentum = getattr(model, "proto_momentum", 0.99)
-
-        proto_sum = torch.zeros_like(model.prototypes, device=device)
-        proto_count = torch.zeros(num_classes, device=device)
-
-        targets_long = targets.long()
-        proto_sum.index_add_(0, targets_long, feats)
-        proto_count.index_add_(0, targets_long, torch.ones_like(targets_long, dtype=feats.dtype))
-
-        valid_mask = proto_count > 0
-        if not valid_mask.any():
-            return
-
-        batch_protos = torch.zeros_like(model.prototypes, device=device)
-        batch_protos[valid_mask] = proto_sum[valid_mask] / proto_count[valid_mask].unsqueeze(1)
-
-        new_init_mask = valid_mask & (~model.is_proto_init)
-        if new_init_mask.any():
-            batch_to_init = batch_protos[new_init_mask]
-            norm = batch_to_init.norm(dim=1, keepdim=True).clamp_min(1e-6)
-            model.prototypes[new_init_mask] = batch_to_init / norm
-            model.is_proto_init[new_init_mask] = True
-
-        ema_mask = valid_mask & model.is_proto_init
-        if ema_mask.any():
-            model.prototypes[ema_mask] = F.normalize(
-                momentum * model.prototypes[ema_mask] + (1 - momentum) * batch_protos[ema_mask],
-                dim=1
-            )
+        pass
 
 
     def _calculate_hybrid_proto_loss(self, feats, targets, model):
-        """
-        计算修复后的混合原型损失 (InfoNCE L_attraction + ReLU L_repulsion)。
-        """
-
-        self._update_prototypes(feats, targets, model)
-
-        # 2. 取已初始化的原型
-        proto_mask = model.is_proto_init
-        if not proto_mask.any():
-            return torch.tensor(0., device=feats.device)
-
-        prototypes = model.prototypes[proto_mask]  # [K, C]
-        # 只选择当前 batch 中存在的类别
-        batch_classes = torch.unique(targets)
-        valid_classes_mask = proto_mask.clone()
-        valid_classes_mask[
-            ~torch.isin(torch.arange(model.prototypes.shape[0], device=feats.device), batch_classes)] = False
-        if valid_classes_mask.sum() == 0:
-            return torch.tensor(0., device=feats.device)
-
-        prototypes = model.prototypes[valid_classes_mask]
-
-        # 3. 相似度 / tau
-        tau = getattr(model, "tau", 0.1)
-        sim_matrix = torch.matmul(feats, prototypes.t()) / tau
-
-        # --- L_attraction (InfoNCE) ---
-        # targets 映射到 prototypes 的索引
-        class_map = torch.zeros(model.prototypes.shape[0], dtype=torch.long, device=feats.device) - 1
-        class_map[valid_classes_mask] = torch.arange(valid_classes_mask.sum(), device=feats.device)
-        valid_targets = class_map[targets.long()]
-        # 避免-1 index
-        mask = valid_targets >= 0
-        if mask.sum() == 0:
-            return torch.tensor(0., device=feats.device)
-
-        L_attraction = F.nll_loss(F.log_softmax(sim_matrix[mask], dim=1), valid_targets[mask])
-
-        # --- L_repulsion (Hard Negative ReLU)
-        sim_matrix_hard = sim_matrix.clone()
-        sim_matrix_hard[torch.arange(sim_matrix_hard.size(0), device=feats.device), valid_targets.clamp_min(0)] = -1e4
-        neg_sim, _ = sim_matrix_hard.max(dim=1)
-        L_repulsion = torch.relu(neg_sim).mean()
-
-        return L_attraction + getattr(model, "lambda_repulsion", 0.5) * L_repulsion
+        return torch.tensor(0., device=feats.device)
 
     def _before_epoch(self) -> None:
         self.model.train()
@@ -165,8 +94,14 @@ class MinkUnetV2Trainer(Trainer):
         inputs = _inputs['lidar']
         targets = feed_dict['targets'].F.long().cuda(non_blocking=True)
 
+        if 'is_augmented' in feed_dict:
+            is_augmented = feed_dict['is_augmented'].long().cuda(non_blocking=True)
+        else:
+            batch_size = inputs.C[:, -1].max() + 1
+            is_augmented = torch.zeros((batch_size,), dtype=torch.long).cuda(non_blocking=True)
+
         with amp.autocast(enabled=self.amp_enabled):
-            outputs, f_content, f_style = self.model(inputs)
+            outputs, f_content, f_style, aug_logits = self.model(inputs)
 
             if outputs.requires_grad:
 
@@ -184,23 +119,51 @@ class MinkUnetV2Trainer(Trainer):
                     den = dynamic_weights.sum().clamp_min(1e-6)
                     L_CE_W = (loss_ce_per_point * dynamic_weights).sum() / den
 
-                    # 2. L_Proto (混合对比式)
-                    L_Proto_Hybrid = self._calculate_hybrid_proto_loss(f_content_v, targets_v, self.model)
+                    # 2. 初始化辅助损失
+                    L_Proto_Hybrid = torch.tensor(0., device=targets.device)
+                    L_Orth = torch.tensor(0., device=targets.device)
+                    L_StyleReg = torch.tensor(0., device=targets.device)
+                    L_Aug = torch.tensor(0., device=targets.device)
 
-                    # 3. L_Orth (正交约束)
-                    dot_product = torch.sum(f_content_v * f_style_v, dim=1)
-                    L_Orth = torch.mean(dot_product**2)
+                    if self.epoch_num >= self.disentangle_start_epoch:
 
-                    # 4. L_StyleReg (风格抑制)
-                    L_StyleReg = torch.mean(f_style_v**2)
+                        # L_Proto (现在为 0)
+                        L_Proto_Hybrid = self._calculate_hybrid_proto_loss(f_content_v, targets_v, self.model)
+
+                        # L_Orth (正交约束)
+                        dot_product = torch.sum(f_content_v * f_style_v, dim=1)
+                        L_Orth = torch.mean(dot_product ** 2)
+
+                        # L_StyleReg (风格抑制)
+                        L_StyleReg = torch.mean(f_style_v ** 2)
+
+                        # L_Aug (Augmentation 分类损失)
+                        batch_size = is_augmented.size(0)
+                        L_Aug_list = []
+                        for i in range(batch_size):
+                            scene_mask = (inputs.C[:, -1] == i).cuda()
+
+                            # 对该场景的 Aug Logits 进行平均池化
+                            if scene_mask.any():
+                                # aug_logits 是点云级别的，取场景内的均值作为场景特征
+                                mean_aug_logits = aug_logits[scene_mask].mean(dim=0).unsqueeze(0)
+                                # 监督该场景的 Aug Flag (is_augmented[i] 是该场景的标签)
+                                L_Aug_list.append(F.cross_entropy(mean_aug_logits, is_augmented[i].unsqueeze(0)))
+
+                        if L_Aug_list:
+                            L_Aug = torch.stack(L_Aug_list).mean()
+                        else:
+                            L_Aug = torch.tensor(0., device=targets.device)
 
                     loss = L_CE_W + self.lambda_proto * L_Proto_Hybrid + \
-                           self.lambda_orth * L_Orth + self.lambda_style * L_StyleReg
+                           self.lambda_orth * L_Orth + self.lambda_style * L_StyleReg + \
+                           self.lambda_aug * L_Aug
 
                     self.summary.add_scalar('L_CE_W', L_CE_W.item())
                     self.summary.add_scalar('L_Proto_Hybrid', L_Proto_Hybrid.item())
                     self.summary.add_scalar('L_Orth', L_Orth.item())
                     self.summary.add_scalar('L_StyleReg', L_StyleReg.item())
+                    self.summary.add_scalar('L_Aug', L_Aug.item())  # *** 记录 L_Aug ***
                     self.summary.add_scalar('loss', loss.item())
 
                     self.optimizer.zero_grad()
@@ -216,6 +179,7 @@ class MinkUnetV2Trainer(Trainer):
                     'outputs': outputs,
                     'targets': targets,
                 }
+
             else:
                 invs = feed_dict['inverse_map']
                 all_labels = feed_dict['targets_mapped']
@@ -330,7 +294,7 @@ def evaluate(val_loader, model):
                 if not 'name' in key:
                     _inputs[key] = value.cuda()
             inputs = _inputs['lidar']
-            outputs, _, _ = model(inputs)
+            outputs, _, _ , _= model(inputs)
 
             invs = feed_dict['inverse_map']
             all_labels = feed_dict['targets_mapped']

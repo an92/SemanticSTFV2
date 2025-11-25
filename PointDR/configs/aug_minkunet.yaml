@@ -70,17 +70,17 @@ src_dataset:
       prob: 0.1
 
 
-tgt_dataset:
-  name: semantickitti
-  root: /home/dataset/SemanticKITTI/sequences
-  num_points: 80000
-  voxel_size: 0.05
-
 #tgt_dataset:
-#  name: semanticstf
-#  root: /home/dataset/SemanticSTF
+#  name: semantickitti
+#  root: /home/dataset/SemanticKITTI/sequences
 #  num_points: 80000
 #  voxel_size: 0.05
+
+tgt_dataset:
+  name: semanticstf
+  root: /home/dataset/SemanticSTF
+  num_points: 80000
+  voxel_size: 0.05
 
 num_epochs: 30
 batch_size: 8

@@ -52,6 +52,14 @@ def get_aug_single_kitti(phase):
     return dataset[phase]
 
 
+def get_aug_single_kittiV1(phase):
+    from core.datasets import SingleAugSemanticKITTIV1
+    dataset_config = configs.src_dataset if phase == 'train' else configs.tgt_dataset
+    dataset = SingleAugSemanticKITTIV1(root=dataset_config.root, num_points=dataset_config.num_points, voxel_size=dataset_config.voxel_size, strong_aug=dataset_config.get('strong_aug'))
+
+    return dataset[phase]
+
+
 def get_synlidar():
     from core.datasets import SynLiDAR
     dataset_config = configs.src_dataset
@@ -78,6 +86,8 @@ def make_dataset() -> Dataset:
         src_dataset = get_aug_kitti(phase='train')
     elif configs.src_dataset.name == 'semanticAugSinglekitti':
         src_dataset = get_aug_single_kitti(phase='train')
+    elif configs.src_dataset.name == 'SingleAugSemanticKITTIV1':
+        src_dataset = get_aug_single_kittiV1(phase='train')
     elif configs.src_dataset.name == 'semanticstf':
         src_dataset = get_stf(phase='train')
     elif configs.src_dataset.name == 'semantic_learner':

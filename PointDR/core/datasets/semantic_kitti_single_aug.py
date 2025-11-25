@@ -2,6 +2,7 @@ import os
 from typing import Dict, Any, Tuple
 
 import numpy as np
+import torch
 from torchsparse import SparseTensor
 from torchsparse.utils.collate import sparse_collate_fn
 from torchsparse.utils.quantize import sparse_quantize
@@ -14,7 +15,6 @@ from PointDR.core.datasets.transform_3d import apply_rotate_scale, \
     apply_flip_axis, apply_intensity_channel_distortion, apply_physical_attenuation_model, \
     apply_selective_range_jittering, apply_weather_layered_augmentation, apply_geometry_selective_jitter, \
     apply_distance_biased_point_drop, apply_intensity_jitter,  apply_occlusion_patch
-
 
 AUG_MAP = {
     'rotate_scale': apply_rotate_scale,
@@ -149,7 +149,7 @@ class SingleAugSemanticKITTIInternal:
     def __len__(self):
         return len(self.files)
 
-    def return_aug_single_views(self, index):
+    def return_aug_single_views(self, index, should_apply_strong_aug: bool = False):
         with open(self.files[index], 'rb') as b:
             block_ = np.fromfile(b, dtype=np.float32).reshape(-1, 4)
 
@@ -164,7 +164,17 @@ class SingleAugSemanticKITTIInternal:
 
         labels_ = self.label_map[all_labels & 0xFFFF].astype(np.int64)
 
-        block_, labels_, ids = self.pipeline.run_pipeline(block_.copy(), labels_.copy(), ids.copy(), self.pipeline.strong_steps)
+        if should_apply_strong_aug and self.pipeline.strong_steps:
+            block_, labels_, ids = self.pipeline.run_pipeline(
+                block_.copy(),
+                labels_.copy(),
+                ids.copy(),
+                self.pipeline.strong_steps,
+            )
+            applied_strong_aug = True
+        else:
+            block_, labels_, ids = block_.copy(), labels_.copy(), ids.copy()
+            applied_strong_aug = False
 
         pc_ = np.round(block_[:, :3] / self.voxel_size).astype(np.int32)
         pc_ -= pc_.min(0, keepdims=True)
@@ -189,10 +199,14 @@ class SingleAugSemanticKITTIInternal:
             'targets_mapped': labels_,
             'inverse_map': inverse_map,
             'file_name': self.files[index],
+            'is_augmented': torch.tensor(1 if applied_strong_aug else 0, dtype=torch.long),
         }
 
     def __getitem__(self, index):
-        return self.return_aug_single_views(index)
+        if self.split == 'train':
+            apply_aug = np.random.rand() < 0.5  # 50% 概率应用强增强
+            return self.return_aug_single_views(index, should_apply_strong_aug=apply_aug)
+
 
     @staticmethod
     def collate_fn(inputs):
