@@ -152,6 +152,20 @@ def make_model() -> nn.Module:
         else:
             cr = 1.0
         model = MinkUNetV2(num_classes=configs.data.num_classes, cr=cr, lambda_repulsion=configs.model.lambda_repulsion)
+    elif configs.model.name == 'minkunet_v3':
+        from core.models.semantic_kitti import MinkUNetV3
+        if 'cr' in configs.model:
+            cr = configs.model.cr
+        else:
+            cr = 1.0
+        model = MinkUNetV3(num_classes=configs.data.num_classes, cr=cr, lambda_repulsion=configs.model.lambda_repulsion)
+    elif configs.model.name == 'minkunet_v4':
+        from core.models.semantic_kitti import MinkUNetV4
+        if 'cr' in configs.model:
+            cr = configs.model.cr
+        else:
+            cr = 1.0
+        model = MinkUNetV4(num_classes=configs.data.num_classes, cr=cr, lambda_repulsion=configs.model.lambda_repulsion)
 
     elif configs.model.name == 'minkunet_learner':
         from core.models.semantic_kitti import MinkUNet_Learner
