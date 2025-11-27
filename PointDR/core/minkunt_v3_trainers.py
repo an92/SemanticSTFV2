@@ -186,19 +186,20 @@ class MinkUnetV3Trainer(Trainer):
             decoupled_output = model_output['decoupled_features']
 
             if outputs.requires_grad:
-                valid_mask = targets != self.ignore_label
-                if not valid_mask.any():
-                    return {'outputs': outputs, 'targets': targets}
-
-                # --- 1. CE loss with uncertainty weight (Main Loss) ---
-                logits_v = outputs[valid_mask]
-                targets_v = targets[valid_mask]
-                loss_ce_per_point = self.criterion_reduction_none(logits_v, targets_v)
-
-                weight_v = uncertainty_weight(logits_v, dim=1, temp=self.temp_uncertainty)
-                # 钳制分母，防止除零
-                den = weight_v.sum().clamp_min(1.0)
-                L_CE_W = (loss_ce_per_point * weight_v).sum() / den
+                L_CE_W = self.criterion(outputs, targets)
+                # valid_mask = targets != self.ignore_label
+                # if not valid_mask.any():
+                #     return {'outputs': outputs, 'targets': targets}
+                #
+                # # --- 1. CE loss with uncertainty weight (Main Loss) ---
+                # logits_v = outputs[valid_mask]
+                # targets_v = targets[valid_mask]
+                # loss_ce_per_point = self.criterion_reduction_none(logits_v, targets_v)
+                #
+                # weight_v = uncertainty_weight(logits_v, dim=1, temp=self.temp_uncertainty)
+                # # 钳制分母，防止除零
+                # den = weight_v.sum().clamp_min(1.0)
+                # L_CE_W = (loss_ce_per_point * weight_v).sum() / den
 
                 # --- 2. Initialize disentangle losses ---
                 L_Orth, L_Style, L_Aug = torch.tensor(0., device=outputs.device), torch.tensor(0.,
