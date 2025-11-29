@@ -6,7 +6,10 @@ data:
 model:
   name: minkunet
   cr: 0.5
-  alpha: 0.5
+  alpha_init: 0.5
+  alpha_rate: 0.05
+  alpha_max: 2.5
+# 默认配置，等同于V1地第一个版本；
 
 
 train:

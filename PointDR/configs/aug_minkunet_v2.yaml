@@ -6,8 +6,10 @@ data:
 model:
   name: minkunet_v2
   cr: 0.5
-  alpha: 1.0
-  lamda: 1.0
+  alpha_init: 0.5
+  alpha_rate: 0.05
+  alpha_max: 2.5
+  lamda: 0.1
 
 train:
   seed: 1588147245

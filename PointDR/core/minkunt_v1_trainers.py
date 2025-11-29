@@ -21,20 +21,16 @@ import tqdm
 __all__ = ['MinkUnetV1Trainer']
 
 
-def dg_uncertainty_weight(logits: torch.Tensor, dim: int = 1, alpha: float = 0.7) -> torch.Tensor:
-    """
-    计算 Soft Weighting 权重。该权重增强了不确定性高（熵高）的样本。
+def dg_uncertainty_weight(
+    logits: torch.Tensor,
+    dim: int = 1,
+    epoch_num: int = 1,
+    alpha_init: float = 0.5,
+    alpha_rate: float = 0.05,
+    alpha_max: float = 2.5,
+) -> torch.Tensor:
+    alpha_t = min(alpha_max, alpha_init + epoch_num * alpha_rate)
 
-    Args:
-        logits (torch.Tensor): 模型的原始输出（在分割任务中形状通常为 [N, C]）。
-        dim (int): 类别维度，默认为 1。
-        alpha (float): 强调困难样本的超参数 (alpha >= 0)。
-
-    Returns:
-        torch.Tensor: 每个样本的权重张量，形状与 logits.shape[0] 相同。
-    """
-
-    # 1. 计算概率（标准 Softmax，即 temp=1.0）
     probs = F.softmax(logits, dim=dim)
 
     # 2. 计算熵 (Entropy)
@@ -45,12 +41,14 @@ def dg_uncertainty_weight(logits: torch.Tensor, dim: int = 1, alpha: float = 0.7
     C = logits.size(dim)
     max_entropy = torch.log(torch.tensor(C, dtype=logits.dtype, device=logits.device) + 1e-8)
 
-    # 4. Soft Weighting 公式: 1 + alpha * (Entropy / Max_Entropy)
+    # # 4. Soft Weighting 公式: 1 + alpha * (Entropy / Max_Entropy)
+    # normalized_entropy = entropy / max_entropy
+    # weight = 1.0 + alpha * normalized_entropy
     normalized_entropy = entropy / max_entropy
-    weight = 1.0 + alpha * normalized_entropy
+    weight = torch.exp(-alpha_t * normalized_entropy)
 
-    # 返回分离梯度的权重
     return weight.detach()
+
 
 class MinkUnetV1Trainer(Trainer):
 
@@ -63,7 +61,9 @@ class MinkUnetV1Trainer(Trainer):
         num_workers: int,
         seed: int,
         amp_enabled: bool = False,
-        alpha: float = 0.7,
+        alpha_init: float = 0.5,
+        alpha_rate: float = 0.05,
+        alpha_max: float = 2.5,
     ) -> None:
         self.model = model
         self.criterion = criterion
@@ -79,7 +79,9 @@ class MinkUnetV1Trainer(Trainer):
 
         self.ignore_label = 255
 
-        self.alpha = alpha
+        self.alpha_init = alpha_init
+        self.alpha_rate = alpha_rate
+        self.alpha_max = alpha_max
 
         self.criterion_reduction_none = nn.CrossEntropyLoss(ignore_index=self.ignore_label, reduction='none')
 
@@ -110,7 +112,14 @@ class MinkUnetV1Trainer(Trainer):
 
                 loss_ce_per_point = self.criterion_reduction_none(logits_v, targets_v)
 
-                weight_v = dg_uncertainty_weight(logits_v, dim=1, alpha =self.alpha)
+                weight_v = dg_uncertainty_weight(
+                    logits_v,
+                    dim=1,
+                    epoch_num=self.epoch_num,
+                    alpha_init=self.alpha_init,
+                    alpha_rate=self.alpha_rate,
+                    alpha_max=self.alpha_max,
+                )
                 den = weight_v.sum().clamp_min(1.0)
                 loss = (loss_ce_per_point * weight_v).sum() / den
 

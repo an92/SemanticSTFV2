@@ -21,20 +21,16 @@ import tqdm
 __all__ = ['MinkUnetV2Trainer']
 
 
-def dg_uncertainty_weight(logits: torch.Tensor, dim: int = 1, alpha: float = 0.7) -> torch.Tensor:
-    """
-    计算 Soft Weighting 权重。该权重增强了不确定性高（熵高）的样本。
+def dg_uncertainty_weight(
+    logits: torch.Tensor,
+    dim: int = 1,
+    epoch_num: int = 1,
+    alpha_init: float = 0.5,
+    alpha_rate: float = 0.05,
+    alpha_max: float = 2.5,
+) -> torch.Tensor:
+    alpha_t = min(alpha_max, alpha_init + epoch_num * alpha_rate)
 
-    Args:
-        logits (torch.Tensor): 模型的原始输出（在分割任务中形状通常为 [N, C]）。
-        dim (int): 类别维度，默认为 1。
-        alpha (float): 强调困难样本的超参数 (alpha >= 0)。
-
-    Returns:
-        torch.Tensor: 每个样本的权重张量，形状与 logits.shape[0] 相同。
-    """
-
-    # 1. 计算概率（标准 Softmax，即 temp=1.0）
     probs = F.softmax(logits, dim=dim)
 
     # 2. 计算熵 (Entropy)
@@ -45,11 +41,14 @@ def dg_uncertainty_weight(logits: torch.Tensor, dim: int = 1, alpha: float = 0.7
     C = logits.size(dim)
     max_entropy = torch.log(torch.tensor(C, dtype=logits.dtype, device=logits.device) + 1e-8)
 
-    # 4. Soft Weighting 公式: 1 + alpha * (Entropy / Max_Entropy)
+    # # 4. Soft Weighting 公式: 1 + alpha * (Entropy / Max_Entropy)
+    # normalized_entropy = entropy / max_entropy
+    # weight = 1.0 + alpha * normalized_entropy
     normalized_entropy = entropy / max_entropy
-    weight = 1.0 + alpha * normalized_entropy
+    weight = torch.exp(-alpha_t * normalized_entropy)
 
     return weight.detach()
+
 
 class GradientReversal(torch.autograd.Function):
     @staticmethod
@@ -84,8 +83,10 @@ class MinkUnetV2Trainer(Trainer):
         num_workers: int,
         seed: int,
         amp_enabled: bool = False,
-        alpha: float = 0.7,
-        lamda: float= 1.0,
+        alpha_init: float = 0.5,
+        alpha_rate: float = 0.05,
+        alpha_max: float = 2.5,
+        lamda: float = 0.1,
     ) -> None:
         self.model = model
         self.criterion = criterion
@@ -101,12 +102,17 @@ class MinkUnetV2Trainer(Trainer):
 
         self.ignore_label = 255
 
-        self.alpha = alpha
-        self.lamda = lamda
+        self.alpha_init = alpha_init
+        self.alpha_rate = alpha_rate
+        self.alpha_max = alpha_max
+        self.feature_dim = 48
         self.num_classes = 19
         self.T = 0.07
+        self.proto_momentum = 0.99
+        self.lambda_ = lamda
 
         self.criterion_reduction_none = nn.CrossEntropyLoss(ignore_index=self.ignore_label, reduction='none')
+        self.register_buffer("global_prototypes", torch.zeros(self.num_classes, self.feature_dim))
 
     def _before_epoch(self) -> None:
         self.model.train()
@@ -135,34 +141,57 @@ class MinkUnetV2Trainer(Trainer):
                 # --- 1. CE loss with uncertainty weight (Main Loss) ---
                 logits_v = outputs[valid_mask]
                 targets_v = targets[valid_mask]
+                feat_1_v = feat_1[valid_mask]  # 取出有效点的特征
 
                 loss_ce_per_point = self.criterion_reduction_none(logits_v, targets_v)
 
-                weight_v = dg_uncertainty_weight(logits_v, dim=1, alpha =self.alpha)
+                weight_v = dg_uncertainty_weight(
+                    logits_v,
+                    dim=1,
+                    epoch_num=self.epoch_num,
+                    alpha_init=self.alpha_init,
+                    alpha_rate=self.alpha_rate,
+                    alpha_max=self.alpha_max,
+                )
                 den = weight_v.sum().clamp_min(1.0)
-                loss_main  = (loss_ce_per_point * weight_v).sum() / den
+                loss_main = (loss_ce_per_point * weight_v).sum() / den
+                feat_1_norm = F.normalize(feat_1_v, dim=1)
 
-                feat_1 = nn.functional.normalize(feat_1, dim=1)
+                with torch.no_grad():
+                    # 遍历所有类别，计算并更新全局原型
+                    for c in range(self.num_classes):
+                        c_mask = targets_v == c
+                        if c_mask.sum() > 0:
+                            c_feats = feat_1_norm[c_mask]
+                            # 核心改动：使用可靠性权重，降低噪声点对原型的影响
+                            c_weights = weight_v[c_mask].view(-1, 1)
 
+                            # Step A: 计算当前 Batch 的加权平均原型
+                            weighted_mean = (c_feats * c_weights).sum(0) / (c_weights.sum() + 1e-8)
+
+                            # Step B: 核心改动：动量更新全局原型
+                            self.global_prototypes[c] = self.proto_momentum * self.global_prototypes[c] + \
+                                                        (1 - self.proto_momentum) * weighted_mean
+
+                # --- 3. Prototype Alignment Loss (Loss Content) ---
                 _, feat_2 = self.model(inputs_2)
-                feat_2 = nn.functional.normalize(feat_2, dim=1)
+                feat_2 = F.normalize(feat_2, dim=1)
 
-                feat1_proto = torch.zeros((self.num_classes, feat_1.shape[1]), device=feat_1.device)
-                for c in range(self.num_classes):
-                    mask = targets == c
-                    if mask.sum() > 0:
-                        feat1_proto[c] = feat_1[mask].mean(dim=0)
-                feat1_proto = (feat1_proto + 1e-8).detach()
+                # 使用稳定且干净的全局原型进行对齐
+                clean_protos = F.normalize(self.global_prototypes, dim=1).detach()
 
                 # logits_content: 点到类原型相似度
-                logits_content = torch.matmul(feat_2, feat1_proto.T) / self.T
+                logits_content = torch.matmul(feat_2, clean_protos.T) / self.T
                 loss_content = self.criterion(logits_content, targets_2)
 
                 # 总 loss
-                loss = loss_main + self.lamda * loss_content
+                loss = loss_main + self.lambda_ * loss_content
 
         if outputs.requires_grad:
             self.summary.add_scalar('loss', loss.item())
+            self.summary.add_scalar('loss_main', loss_main.item())
+            self.summary.add_scalar('loss_content', loss_content.item())
+
 
             self.optimizer.zero_grad()
             self.scaler.scale(loss).backward()
