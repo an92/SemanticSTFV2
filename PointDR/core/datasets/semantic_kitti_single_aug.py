@@ -149,7 +149,7 @@ class SingleAugSemanticKITTIInternal:
     def __len__(self):
         return len(self.files)
 
-    def return_aug_single_views(self, index, should_apply_strong_aug: bool = False):
+    def return_aug_single_views(self, index):
         with open(self.files[index], 'rb') as b:
             block_ = np.fromfile(b, dtype=np.float32).reshape(-1, 4)
 
@@ -164,17 +164,13 @@ class SingleAugSemanticKITTIInternal:
 
         labels_ = self.label_map[all_labels & 0xFFFF].astype(np.int64)
 
-        if should_apply_strong_aug and self.pipeline.strong_steps:
-            block_, labels_, ids = self.pipeline.run_pipeline(
-                block_.copy(),
-                labels_.copy(),
-                ids.copy(),
-                self.pipeline.strong_steps,
-            )
-            applied_strong_aug = True
-        else:
-            block_, labels_, ids = block_.copy(), labels_.copy(), ids.copy()
-            applied_strong_aug = False
+        block_, labels_, ids = self.pipeline.run_pipeline(
+            block_.copy(),
+            labels_.copy(),
+            ids.copy(),
+            self.pipeline.strong_steps,
+        )
+        applied_strong_aug = True
 
         pc_ = np.round(block_[:, :3] / self.voxel_size).astype(np.int32)
         pc_ -= pc_.min(0, keepdims=True)
@@ -199,13 +195,10 @@ class SingleAugSemanticKITTIInternal:
             'targets_mapped': labels_,
             'inverse_map': inverse_map,
             'file_name': self.files[index],
-            'is_augmented': torch.tensor(1 if applied_strong_aug else 0, dtype=torch.long),
         }
 
     def __getitem__(self, index):
-        if self.split == 'train':
-            apply_aug = np.random.rand() < 0.5  # 50% 概率应用强增强
-            return self.return_aug_single_views(index, should_apply_strong_aug=apply_aug)
+        return self.return_aug_single_views(index)
 
 
     @staticmethod

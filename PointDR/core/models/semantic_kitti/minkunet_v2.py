@@ -130,37 +130,7 @@ class MinkUNetV2(nn.Module):
         ])
 
         self.classifier = nn.Sequential(nn.Linear(cs[8], kwargs['num_classes']))
-
-        self.num_classes = kwargs['num_classes']
-        self.content_dim = kwargs.get('content_dim', 128)
-        self.style_dim = kwargs.get('style_dim', 64)
-        self.tau = kwargs.get('tau', 0.07)
-        self.lambda_repulsion = kwargs.get('lambda_repulsion', 0.7)
-        final_dim = cs[8]
-
-        self.proj_head_c = nn.Sequential(    # Content Head
-            nn.Linear(final_dim, self.content_dim * 2),
-            nn.BatchNorm1d(self.content_dim * 2),
-            nn.ReLU(True),
-            nn.Linear(self.content_dim * 2, self.content_dim),
-        )
-        self.proj_head_s = nn.Sequential(    # Style Head
-            nn.Linear(final_dim, self.content_dim * 2),
-            nn.BatchNorm1d(self.content_dim * 2),
-            nn.ReLU(True),
-            nn.Linear(self.content_dim * 2, self.content_dim),
-        )
-
-        self.aug_classifier = nn.Sequential(
-            nn.Linear(self.content_dim, 64),
-            nn.BatchNorm1d(64),
-            nn.ReLU(True),
-            nn.Linear(64, 2),  # 预测 0 (原始) 或 1 (增强)
-        )
-
-        self.register_buffer("prototypes", torch.zeros(self.num_classes, self.content_dim))
-        self.register_buffer("is_proto_init", torch.zeros(self.num_classes, dtype=torch.bool))
-
+        self.proj = nn.Sequential(nn.Linear(cs[8], cs[8]), nn.ReLU(inplace=True), nn.Linear(cs[8], 128))
 
         self.weight_initialization()
 
@@ -193,17 +163,8 @@ class MinkUNetV2(nn.Module):
         y4 = torchsparse.cat([y4, x0])
         y4 = self.up4[1](y4)
 
-        raw_feats = y4.F
-
-        # 分类头
         logits = self.classifier(y4.F)
 
-        # 2. 特征解耦
-        f_content = self.proj_head_c(raw_feats)
-        f_style = self.proj_head_s(raw_feats)
+        feat = self.proj(y4.F)
 
-        f_content = F.normalize(f_content, p=2, dim=1)
-
-        aug_logits = self.aug_classifier(f_style)
-
-        return logits, f_content, f_style, aug_logits
+        return logits, feat

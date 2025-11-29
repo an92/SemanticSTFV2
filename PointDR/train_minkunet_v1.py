@@ -1,6 +1,9 @@
 import argparse
 import random
 import sys
+import os
+
+# os.environ["CUDA_VISIBLE_DEVICES"] = "4"
 
 import numpy as np
 import torch
@@ -83,8 +86,7 @@ def main() -> None:
         num_workers=configs.workers_per_gpu,
         seed=seed,
         amp_enabled=configs.amp_enabled,
-        lambda_ortho=configs.model.lambda_ortho,
-        lambda_weather=configs.model.lambda_weather,
+        alpha = configs.model.alpha,
     )
     trainer.train_with_defaults(
         dataflow['train'],
