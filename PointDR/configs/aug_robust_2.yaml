@@ -6,6 +6,8 @@ data:
 model:
   name: minkunet_robust
   cr: 0.5
+  alpha: 0.3
+  beta: 0.3
 
 train:
   seed: 1588147245
@@ -36,40 +38,35 @@ src_dataset:
       alpha_max: 0.05
       prob: 0.5
 
-    - name: selective_range_jittering
-      mode_prob_angle: 0.5
-      prob: 0.5
-      jitter_dist_factor: 0.0005
-      jitter_base_std: 0.01
-      clip_range: [-0.05, 0.05]
-
     - name: intensity_channel_distortion
       prob: 0.7
       gamma_max: 1.3
       gamma_min: 0.7
       gamma_prob: 0.5
+    - name: nonuniform_region_perturbation
+      prob: 0.5  # 触发 NRP 的概率为 0.5
+      depth_selective_perturbation:
+        prob: 0.5             # DSP 独立触发概率 0.5
+        d_range: [20.0, 80.0] # 深度选择区间
+        base_std: 0.010       # 保守的基准高斯噪声 (约 1 cm)
+        dist_factor: 0.0001   # 距离因子 (使远处 sigma 缓慢增大)
+      scanline_selective_perturbation:
+        prob: 0.5             # SSP 独立触发概率 0.5
+        num_segments: 3
+        angle_width: 0.1745   # 约 10 度
+        ssp_std: 0.02         # 扫描线扰动标准差 (约 2 cm)
 
-    - name: random_general_jittering
-      prob: 0.2
-      scale: 0.005
-      max_clip: 0.01
-
-    - name: distance_biased_point_drop
-      prob: 0.2
-      base_drop: 0.04
-      max_drop: 0.2
-      r_scale: 60.0
-      gamma: 0.3
-      density_voxel_size: 2.0
-      protect_small_classes: [0,1,2,3,4,5,6,7, 13, 17, 18 ]
-      protect_scale: 0.5
-
-    - name: occlusion_patch
-      num_patches: 1
-      patch_size: 2.0
-      prob: 0.1
-
-
+    - name: depth_adaptive_sparsity_augmentation
+      prob: 0.5  # 触发 DSA 的概率为 0.5
+      depth_aware_drop:
+        prob: 0.7             # D-Drop 独立触发概率 0.7 (因为这是核心退化)
+        d_min: 0.5
+        d_max: 100.0
+        alpha: 0.4            # 最大丢弃概率系数 (40% 的最远点被丢弃)
+      clustered_drop:
+        prob: 0.3             # Clustered-Drop 独立触发概率 0.3 (保守)
+        num_clusters: 2
+        radius: 0.7           # 局部簇状丢弃半径 (保守，小于 0.8 米)
 #tgt_dataset:
 #  name: semantickitti
 #  root: /home/dataset/SemanticKITTI/sequences
@@ -82,7 +79,7 @@ tgt_dataset:
   num_points: 80000
   voxel_size: 0.05
 
-num_epochs: 30
+num_epochs: 50
 batch_size: 8
 
 criterion:
@@ -91,7 +88,7 @@ criterion:
 
 optimizer:
   name: sgd
-  lr: 0.02
+  lr: 2.4e-1
   weight_decay: 1.0e-4
   momentum: 0.9
   nesterov: true

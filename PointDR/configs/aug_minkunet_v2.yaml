@@ -6,32 +6,20 @@ data:
 model:
   name: minkunet_v2
   cr: 0.5
-  alpha_init: 0.5
-  alpha_rate: 0.05
-  alpha_max: 2.5
-  lamda: 0.1
+  reduction: 0.8
+  percentile: 80
 
 train:
   seed: 1588147245
   deterministic: False
 
 src_dataset:
-  name: semanticAugkitti
+  name: semanticAugSinglekitti
   root: /home/dataset/SemanticKITTI/sequences
   num_points: 80000
   voxel_size: 0.05
 
-  # --- Weak Aug 流程 ---
-  weak_aug:
-    - name: rotate_scale         # 旋转和缩放
-      prob: 1.0
-      min_angle: 0.0
-      max_angle: 6.283185 # 2 * pi
-      min_scale: 0.95
-      max_scale: 1.05
-
-
-  # --- 定义 Strong Aug 流程---
+  # --- 定义 Aug 流程---
   strong_aug:
     - name: rotate_scale
       prob: 1.0
@@ -82,6 +70,7 @@ src_dataset:
       num_patches: 1
       patch_size: 2.0
       prob: 0.1
+
 
 #tgt_dataset:
 #  name: semantickitti

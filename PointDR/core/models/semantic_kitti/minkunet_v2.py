@@ -110,6 +110,6 @@ class MinkUNetV2(nn.Module):
 
         logits = self.classifier(y4.F)
 
-        feat = self.proj(y4.F)
+        # feat = self.proj(y4.F)
 
-        return logits, feat
+        return logits, y4.F

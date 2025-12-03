@@ -2,9 +2,9 @@ import numpy as np
 import torch
 from torch import nn
 from torch.cuda import amp
-from torch_scatter import scatter_mean
 from torchpack.train import Trainer
 from torchpack.utils.typing import Optimizer, Scheduler
+import torch.nn.functional as F
 
 import time
 from typing import Any, Dict, List, Optional, Callable
@@ -17,30 +17,8 @@ from torchpack.utils import humanize
 from torchpack.utils.logging import logger
 from core.callbacks import MeanIoU
 import tqdm
-from torch.autograd import Function
 
 __all__ = ['MinkUnetV3Trainer']
-
-
-class GRL(Function):
-
-    @staticmethod
-    def forward(ctx, x, alpha=1.0):
-        ctx.alpha = alpha
-        return x.view_as(x)
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        return -ctx.alpha * grad_output, None
-
-
-def uncertainty_weight(logits, dim=1, temp=1.0):
-    probs = torch.softmax(logits / temp, dim=dim)
-    entropy = -torch.sum(probs * torch.log(probs + 1e-8), dim=dim)
-    C = logits.size(dim)
-    max_entropy = torch.log(torch.tensor(C, dtype=logits.dtype, device=logits.device) + 1e-8)
-    weight = 1.0 - (entropy / max_entropy)
-    return weight.detach()
 
 
 class MinkUnetV3Trainer(Trainer):
@@ -54,12 +32,8 @@ class MinkUnetV3Trainer(Trainer):
             num_workers: int,
             seed: int,
             amp_enabled: bool = False,
-            lambda_aug: float = 0.1,
-            decouple_layers: List[str] = None,
-            disentangle_start_epoch: int=5,
-            temp_uncertainty: float=1.0
+            lambda_refine: float = 0.05,
     ) -> None:
-        # --- keep basic fields ---
         self.model = model
         self.criterion = criterion
         self.optimizer = optimizer
@@ -71,15 +45,9 @@ class MinkUnetV3Trainer(Trainer):
         self.epoch_num = 1
 
         self.ignore_label = 255
-        self.lambda_aug = lambda_aug
-        self.num_sample_aux = 4096
-        self.temp_uncertainty = temp_uncertainty
-        self.disentangle_start_epoch = disentangle_start_epoch
 
-        self.decouple_layers = decouple_layers if decouple_layers is not None else ['y3', 'y4']
-
-        self.criterion_reduction_none = nn.CrossEntropyLoss(ignore_index=self.ignore_label, reduction='none')
-        self.criterion_ce_no_ig = nn.CrossEntropyLoss()  # 用于 L_Aug
+        self.lambda_refine = lambda_refine  # 新增 L_refine 权重
+        self.num_classes = 19
 
         self.summary = None
         self.callbacks = None
@@ -101,97 +69,130 @@ class MinkUnetV3Trainer(Trainer):
         inputs = _inputs['lidar']
         targets = feed_dict['targets'].F.long().cuda(non_blocking=True)
 
-        batch_size = int(inputs.C[:, -1].max().item() + 1)
-
-        if 'is_augmented' in feed_dict:
-            # is_augmented: (Batch_Size) 0代表原始域，1代表增强域
-            is_augmented = feed_dict['is_augmented'].long().cuda(non_blocking=True)
-        else:
-            is_augmented = torch.zeros((batch_size,), dtype=torch.long).cuda(non_blocking=True)
-
         with amp.autocast(enabled=self.amp_enabled):
-            model_output = self.model(inputs)
-            outputs = model_output['logits']
-            decoupled_output = model_output['decoupled_features']
+            outputs_1, feat_1 = self.model(inputs)
 
-            if outputs.requires_grad:
-                valid_mask = targets != self.ignore_label
-                # --- 1. CE loss with uncertainty weight (Main Loss) ---
-                logits_v = outputs[valid_mask]
-                targets_v = targets[valid_mask]
+        if outputs_1.requires_grad:
+            # ------------------------------
+            # Step 1: Segmentation loss
+            # ------------------------------
+            loss_seg = self.criterion(outputs_1, targets)
 
-                loss_ce_per_point = self.criterion_reduction_none(logits_v, targets_v)
+            # ------------------------------
+            # Step 2: L_refine
+            # ------------------------------
+            inputs_2 = _inputs['lidar_2']
+            targets_2 = feed_dict['targets_2'].F.long().cuda(non_blocking=True)
+            with amp.autocast(enabled=self.amp_enabled):
+                outputs_2, feat_2 = self.model(inputs_2)
 
-                weight_v = uncertainty_weight(logits_v, dim=1, temp=self.temp_uncertainty)
-                den = weight_v.sum().clamp_min(1.0)
-                L_CE_W = (loss_ce_per_point * weight_v).sum() / den
+            # ------------------------------
+            # Step 2a: 选出有效点
+            # ------------------------------
+            valid_mask_1 = targets != self.ignore_label
+            valid_mask_2 = targets_2 != self.ignore_label
 
-                # L_CE_W = self.criterion(outputs, targets)
+            feat_1_v = feat_1[valid_mask_1]
+            targets_v1 = targets[valid_mask_1]
 
-                # --- 2. Initialize disentangle losses ---
-                L_Aug = torch.tensor(0., device=outputs.device)
+            feat_2_v = feat_2[valid_mask_2]
+            targets_v2 = targets_2[valid_mask_2]
 
-                if self.epoch_num >= self.disentangle_start_epoch and self.lambda_aug > 0:
+            # 检查梯度
+            if not feat_1_v.requires_grad or not feat_2_v.requires_grad:
+                print("Warning: features have no grad!")
 
-                    NUM_SAMPLE = self.num_sample_aux
+            # ------------------------------
+            # Step 2b: 类别统计
+            # ------------------------------
+            L_domain = 0.0
+            all_class_means = []
 
-                    name = 'y4'
-                    f_style_l = decoupled_output['f_style'][name]  # (N, C)
+            for c in range(self.num_classes):
+                mask_c1 = (targets_v1 == c)
+                mask_c2 = (targets_v2 == c)
+                n1 = mask_c1.sum().item()
+                n2 = mask_c2.sum().item()
 
-                    N_layer = f_style_l.shape[0]
+                # 跳过空类别
+                if n1 == 0 or n2 == 0:
+                    continue
 
-                    if N_layer > NUM_SAMPLE:
-                        perm = torch.randperm(N_layer, device=outputs.device)[:NUM_SAMPLE]
-                        f_style_sub = f_style_l[perm]
-                        coords_sub = decoupled_output['coords'][name][perm]
-                    else:
-                        f_style_sub = f_style_l
-                        coords_sub = decoupled_output['coords'][name]
+                f1_c = feat_1_v[mask_c1]
+                f2_c = feat_2_v[mask_c2]
 
+                mu_1 = f1_c.mean(dim=0)
+                mu_2 = f2_c.mean(dim=0)
 
-                    f_style_rev = GRL.apply(f_style_sub, torch.tensor(1.0, device=f_style_sub.device))
+                # 累加 L_domain
+                L_domain += F.mse_loss(mu_1, mu_2, reduction='mean')
 
-                    aug_logits = self.model.aug_classifiers[name](f_style_rev)
+                # 累加类平均
+                Z_l = (mu_1 + mu_2) / 2
+                all_class_means.append(Z_l.unsqueeze(0))
 
-                    scene_ids = coords_sub[:, 3].long()
-                    mean_logits = scatter_mean(aug_logits, scene_ids, dim=0, dim_size=batch_size)
-
-                    L_Aug = self.criterion_ce_no_ig(mean_logits, is_augmented)
-
-                loss = L_CE_W + self.lambda_aug * L_Aug
-
-                self.optimizer.zero_grad()
-                self.scaler.scale(loss).backward()
-
-                self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
-
-                self.scaler.step(self.optimizer)
-                self.scheduler.step()
-                self.scaler.update()
-
-                # --- summary logging ---
-                self.summary.add_scalar('L_CE_W', float(L_CE_W.item()))
-                self.summary.add_scalar('L_Aug', float(L_Aug.item()))
-                self.summary.add_scalar('loss', float(loss.item()))
-
-                return {'outputs': outputs, 'targets': targets}
+            # ------------------------------
+            # Step 2c: L_class_variance
+            # ------------------------------
+            if len(all_class_means) > 0:
+                Z_c_all = torch.cat(all_class_means, dim=0)
+                Z_c_bar = Z_c_all.mean(dim=0, keepdim=True)
+                L_class_variance = torch.mean((Z_c_all - Z_c_bar) ** 2)
             else:
-                invs = feed_dict['inverse_map']
-                all_labels = feed_dict['targets_mapped']
-                _outputs = []
-                _targets = []
-                for idx in range(invs.C[:, -1].max() + 1):
-                    cur_scene_pts = (inputs.C[:, -1] == idx).cpu().numpy()
-                    cur_inv = invs.F[invs.C[:, -1] == idx].cpu().numpy()
-                    cur_label = (all_labels.C[:, -1] == idx).cpu().numpy()
-                    outputs_mapped = outputs[cur_scene_pts][cur_inv].argmax(1)
-                    targets_mapped = all_labels.F[cur_label]
-                    _outputs.append(outputs_mapped)
-                    _targets.append(targets_mapped)
-                outputs = torch.cat(_outputs, 0)
-                targets = torch.cat(_targets, 0)
-                return {'outputs': outputs, 'targets': targets}
+                L_class_variance = torch.tensor(0.0, device=feat_1.device)
+
+            # ------------------------------
+            # Step 2d: L_refine组合
+            # ------------------------------
+            L_refine = L_domain - L_class_variance
+
+            # 打印调试信息
+            print(f"L_domain: {L_domain.item():.6f}, "
+                  f"L_class_var: {L_class_variance.item():.6f}, "
+                  f"L_refine: {L_refine.item():.6f}, "
+                  f"lambda_refine: {self.lambda_refine}")
+
+            # ------------------------------
+            # Step 3: 总 loss
+            # ------------------------------
+            loss = loss_seg + self.lambda_refine * L_refine
+
+            self.summary.add_scalar('loss', loss.item())
+            self.summary.add_scalar('loss_seg', loss_seg.item())
+            self.summary.add_scalar('L_domain', L_domain.item())
+            self.summary.add_scalar('L_class_var', L_class_variance.item())
+            self.summary.add_scalar('L_refine_total', L_refine.item())
+
+            # ------------------------------
+            # Step 4: backward
+            # ------------------------------
+            self.optimizer.zero_grad()
+            self.scaler.scale(loss).backward()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+            self.scheduler.step()
+
+            return {
+                'outputs': outputs_1,
+                'targets': targets,
+            }
+
+        else:
+            invs = feed_dict['inverse_map']
+            all_labels = feed_dict['targets_mapped']
+            _outputs = []
+            _targets = []
+            for idx in range(invs.C[:, -1].max() + 1):
+                cur_scene_pts = (inputs.C[:, -1] == idx).cpu().numpy()
+                cur_inv = invs.F[invs.C[:, -1] == idx].cpu().numpy()
+                cur_label = (all_labels.C[:, -1] == idx).cpu().numpy()
+                outputs_mapped = outputs_1[cur_scene_pts][cur_inv].argmax(1)
+                targets_mapped = all_labels.F[cur_label]
+                _outputs.append(outputs_mapped)
+                _targets.append(targets_mapped)
+            outputs = torch.cat(_outputs, 0)
+            targets = torch.cat(_targets, 0)
+            return {'outputs': outputs, 'targets': targets}
 
     def _state_dict(self) -> Dict[str, Any]:
         state_dict = {}

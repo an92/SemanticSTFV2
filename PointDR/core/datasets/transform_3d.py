@@ -23,7 +23,7 @@ def apply_flip_axis(block: np.ndarray, labels: np.ndarray, ids: np.ndarray, conf
 
 
 def apply_random_jittering(block: np.ndarray, labels: np.ndarray, ids: np.ndarray, config: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """通用随机抖动 (旧 Aug6)"""
+    """通用随机抖动 """
     cfg = config['random_general_jittering']
     jittering = np.random.normal(loc=0., scale=cfg['scale'], size=(block.shape[0], 3)).astype(np.float32)
     jittering = np.clip(jittering, a_min=-cfg['max_clip'], a_max=cfg['max_clip'])
@@ -224,140 +224,21 @@ from typing import Dict, Any, Tuple
 
 things_class_ids = [0, 1, 2, 3, 4, 5, 6, 7, 13, 17, 18]
 
-def apply_weather_layered_augmentation(block: np.ndarray, labels: np.ndarray, ids: np.ndarray, config: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    天气分层增强：
-    - 雪、雨、雾、薄雾
-    - 每种天气按概率执行
-    - 对小目标 (things_class_ids) 使用高概率扰动
-    - 对大结构 (stuff) 使用低概率轻微扰动
-    """
-    cfg = config.get('weather_layered_augmentation', {})
-    if np.random.rand() >= cfg.get('prob', 1.0) or block.shape[0] == 0:
-        return block, labels, ids
-
-    weather_cfg = cfg.get('weather_prob', {
-        'snow': 0.3,
-        'rain': 0.3,
-        'fog': 0.2,
-        'thin_fog': 0.2
-    })
-
-    coords = block[:, :3].copy()
-    feats = block[:, 3:].copy() if block.shape[1] > 3 else None
-
-    # ------------------------
-    # 遍历天气类型
-    # ------------------------
-    for weather, p in weather_cfg.items():
-        if np.random.rand() >= p:
-            continue  # 不触发该天气增强
-
-        # ------------------------
-        # 1. 点丢失增强
-        # ------------------------
-        drop_prob_small = cfg.get('drop_prob_small', 0.3)
-        drop_prob_large = cfg.get('drop_prob_large', 0.05)
-
-        # 保证 mask 与当前 labels 对齐
-        num_points = labels.shape[0]
-        small_mask = np.isin(labels, things_class_ids)
-        large_mask = ~small_mask
-        keep_prob = np.ones(num_points)
-        keep_prob[small_mask] *= 1 - drop_prob_small
-        keep_prob[large_mask] *= 1 - drop_prob_large
-        keep_mask = np.random.rand(num_points) < keep_prob
-
-        coords = coords[keep_mask]
-        labels = labels[keep_mask]
-        ids = ids[keep_mask]
-        if feats is not None:
-            feats = feats[keep_mask]
-
-        # ------------------------
-        # 2. 局部簇扰动
-        # ------------------------
-        cluster_size = cfg.get('cluster_size', 10)
-        sigma_local = cfg.get('sigma_local', 0.02)
-        num_clusters = cfg.get('num_clusters', 5)
-
-        num_points = labels.shape[0]
-        for _ in range(num_clusters):
-            if num_points == 0:
-                break
-            center_idx = np.random.randint(0, num_points)
-            dists = np.linalg.norm(coords - coords[center_idx], axis=1)
-            cluster_mask = np.argsort(dists)[:cluster_size]
-
-            keep_mask_cluster = np.ones(num_points, dtype=bool)
-            keep_mask_cluster[cluster_mask] = False
-
-            coords = coords[keep_mask_cluster]
-            labels = labels[keep_mask_cluster]
-            ids = ids[keep_mask_cluster]
-            if feats is not None:
-                feats = feats[keep_mask_cluster]
-
-            num_points = labels.shape[0]
-
-        # 局部微扰
-        if num_points > 0:
-            coords += np.random.normal(0, sigma_local, coords.shape)
-
-        # ------------------------
-        # 3. 深度漂移（浓雾/薄雾）
-        # ------------------------
-        if weather in ['fog', 'thin_fog'] and num_points > 0:
-            base_sigma = cfg.get('depth_sigma', 0.02)
-            distances = np.linalg.norm(coords, axis=1)
-            max_dist = distances.max() + 1e-6
-            coords[:, 2] += np.random.normal(0, base_sigma * distances / max_dist, size=num_points)
-
-        # ------------------------
-        # 4. 随机孤立点增强（雪/雨）
-        # ------------------------
-        if weather in ['snow', 'rain'] and num_points > 0:
-            noise_ratio = cfg.get('noise_ratio', 0.005)
-            num_noise = int(coords.shape[0] * noise_ratio)
-            if num_noise > 0:
-                xyz_min = coords.min(0)
-                xyz_max = coords.max(0)
-                noise_xyz = np.random.uniform(xyz_min, xyz_max, size=(num_noise, 3))
-                coords = np.concatenate([coords, noise_xyz], axis=0)
-                labels = np.concatenate([labels, np.full(num_noise, 255)], axis=0)
-                ids = np.concatenate([ids, np.arange(ids.max()+1, ids.max()+1+num_noise)], axis=0)
-                if feats is not None:
-                    feats = np.concatenate([feats, np.zeros((num_noise, feats.shape[1]), dtype=feats.dtype)], axis=0)
-
-    # ------------------------
-    # 5. 构造新的 block 返回
-    # ------------------------
-    if feats is not None:
-        block_new = np.hstack([coords, feats])
-    else:
-        block_new = coords
-
-    block_new = block_new.astype(np.float32)
-
-    return block_new, labels, ids
-
-
-
-# ---------------------------------------------------------------------
-# Helper utilities (used by both augmentations)
-# ---------------------------------------------------------------------
-def _voxelize_coords(coords: np.ndarray, voxel_size: float):
+def _voxelize_coords(coords: np.ndarray, voxel_size: float) -> np.ndarray:
     """
     Returns integer voxel indices for coords (N,3).
     """
+    #
     return np.floor(coords / voxel_size).astype(np.int32)
 
-def _compute_voxel_occupancies(coords: np.ndarray, voxel_size: float):
+
+def _compute_voxel_occupancies(coords: np.ndarray, voxel_size: float) -> Tuple[Dict[str, Any], np.ndarray]:
     """
     Return a dict mapping voxel tuple -> indices list and per-point voxel-id index.
     """
     v = _voxelize_coords(coords, voxel_size)
     # create single integer key per voxel for dictionary hashing
+    # Ensure keys are hashable strings
     keys = [f"{a}_{b}_{c}" for a, b, c in v]
     voxel2idx = {}
     point_voxel_key = np.empty(len(keys), dtype=object)
@@ -368,28 +249,23 @@ def _compute_voxel_occupancies(coords: np.ndarray, voxel_size: float):
         voxel2idx[k].append(i)
     return voxel2idx, point_voxel_key
 
-# ---------------------------------------------------------------------
-# 1) Geometry-consistent Selective Jitter (GSJ)
-# ---------------------------------------------------------------------
-def apply_geometry_selective_jitter(block: np.ndarray, labels: np.ndarray, ids: np.ndarray, config: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Geometry-aware selective jitter.
-    block: (N, >=3) float32 with at least xyz in [:,0:3] and optionally intensity at [:,3].
-    labels, ids: 1D arrays aligned with block rows.
-    config: top-level config dict; this function expects config['geometry_selective_jitter'] to contain parameters.
 
-    Returns modified (block, labels, ids).
+# ---------------------------------------------------------------------
+# 1) Geometry-consistent Selective Jitter (GSJ) - Optimized
+# ---------------------------------------------------------------------
+def apply_geometry_selective_jitter(block: np.ndarray, labels: np.ndarray, ids: np.ndarray, config: Dict[str, Any]) -> \
+Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Geometry-aware selective jitter (GSJ).
+    Applies jitter along the local surface normal direction to preserve geometry.
+    NOTE: The final radial-scale clamp is removed to retain the normal-guided effect.
     """
     cfg = config.get('geometry_selective_jitter', {})
-    p_frame = cfg.get('prob', 0.5)                # frame-level apply prob
-    jitter_prob = cfg.get('jitter_prob', 0.25)   # per-point candidate prob
-    base_std = cfg.get('base_std', 0.008)        # meters
+    p_frame = cfg.get('prob', 0.5)  # frame-level apply prob
+    jitter_prob = cfg.get('jitter_prob', 0.25)  # per-point candidate prob
+    base_std = cfg.get('base_std', 0.008)  # meters
     dist_factor = cfg.get('dist_factor', 0.0006)
-    cluster_voxel = cfg.get('cluster_voxel_size', 2.0)  # meters, coarse clustering resolution
-    cluster_min_points = cfg.get('cluster_min_points', 20)
-    min_sf = cfg.get('min_scaling', 0.95)
-    max_sf = cfg.get('max_scaling', 1.05)
-    normal_k = cfg.get('normal_k', 12)           # neigh count for local plane estimation (per-voxel)
+    cluster_voxel = cfg.get('cluster_voxel_size', 2.0)
     rng = np.random
 
     if block is None or block.shape[0] == 0:
@@ -398,77 +274,198 @@ def apply_geometry_selective_jitter(block: np.ndarray, labels: np.ndarray, ids: 
     if rng.rand() > p_frame:
         return block, labels, ids
 
-    coords = block[:, :3].astype(np.float32)
+    coords = block[:, :3].copy().astype(np.float32)
     N = coords.shape[0]
 
-    # --- 1) build coarse voxels to do local PCA (approx normals) and clustering ---
-    # Use coarse voxelization to group nearby points; this avoids O(N^2) kNN
+    # --- 1) Build coarse voxels and compute per-voxel normals (PCA) ---
     voxel2idx, point_voxel_key = _compute_voxel_occupancies(coords, voxel_size=cluster_voxel)
-
-    # compute per-voxel normals by PCA of points in voxel
     normals = np.zeros((N, 3), dtype=np.float32)
+
     for key, idx_list in voxel2idx.items():
         idxs = np.array(idx_list, dtype=np.int32)
         if idxs.size < 3:
+            # Not enough points for PCA, assume flat surface (Z-axis is up)
             normals[idxs] = np.array([0.0, 0.0, 1.0], dtype=np.float32)
             continue
+
         pts = coords[idxs]
-        # PCA (covariance), smallest eigenvector is normal
         centroid = pts.mean(axis=0)
         cov = (pts - centroid).T @ (pts - centroid)
+
         try:
+            # SVD: vt[-1] is the eigenvector corresponding to the smallest eigenvalue (normal)
             _, s, vt = np.linalg.svd(cov)
             normal = vt[-1]
-            # fix NaN or zero normal
-            if not np.all(np.isfinite(normal)):
-                normal = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+            # Normalize and assign
+            normal = normal / (np.linalg.norm(normal) + 1e-8)
             normals[idxs] = normal.astype(np.float32)
-        except Exception:
+        except Exception as e:
+            # Fallback for numerical instability
+            # logging.warning(f"SVD failed: {e}. Defaulting to Z-normal.")
             normals[idxs] = np.array([0.0, 0.0, 1.0], dtype=np.float32)
 
-    # --- 2) select candidate points to jitter ---
+    # --- 2) Select candidate points to jitter ---
     select_mask = (rng.rand(N) < jitter_prob)
     if select_mask.sum() == 0:
         return block, labels, ids
 
-    # --- 3) cluster selected points by coarse voxel again (reuse voxel keys) ---
-    # Build mapping from voxel key to indices among selected points
+    # --- 3) Correlated Jitter applied along Normals (The core GSJ step) ---
     sel_idxs = np.where(select_mask)[0]
     sel_voxel_keys = [point_voxel_key[i] for i in sel_idxs]
     vox2sel = {}
+
     for local_idx, vk in enumerate(sel_voxel_keys):
         if vk not in vox2sel:
             vox2sel[vk] = []
         vox2sel[vk].append(sel_idxs[local_idx])
 
-    # For each selected voxel group (acts as a cluster), sample a scalar offset and apply along normals
     for vk, g_indices in vox2sel.items():
         g_indices = np.array(g_indices, dtype=np.int32)
-        # mean distance of this cluster
+
+        # Calculate distance-dependent sigma for the cluster
         mean_r = np.linalg.norm(coords[g_indices], axis=1).mean() if g_indices.size > 0 else 0.0
         sigma = base_std + dist_factor * mean_r
-        # scalar offset sampled once per cluster (correlated jitter)
+
+        # Sample scalar offset ONCE per cluster (correlated jitter)
         scalar = rng.randn() * sigma
         normals_cluster = normals[g_indices]
-        # apply along normal direction
+
+        # Apply offset along normal direction
         coords[g_indices] = coords[g_indices] + normals_cluster * scalar
 
-    # --- 4) radial-scale clamp to avoid extreme deformation ---
-    orig_r = np.linalg.norm(block[:, :3], axis=1) + 1e-8
-    new_r = np.linalg.norm(coords, axis=1)
-    scales = np.clip(new_r / orig_r, min_sf, max_sf)
-    coords = block[:, :3] * scales[:, None]
-
-    # write back coords into block
+    # --- 4) Radial-scale clamp (REMOVED) ---
+    # The final block update uses the coords modified by GSJ directly.
     block_out = block.copy()
     block_out[:, :3] = coords.astype(np.float32)
 
     return block_out, labels, ids
 
 
+def _compute_structure_strength(coords: np.ndarray, cluster_voxel: float = 2.0) -> np.ndarray:
+    """
+    Computes a 'structure strength' proxy (inverse of the smallest eigenvalue from PCA)
+    for all points based on coarse voxel groups.
+    A higher value means the point belongs to a strong planar or linear structure (high protection).
+    """
+    N = coords.shape[0]
+    # Smallest eigenvalue (lambda_0) is proportional to curvature. Low lambda_0 means flat/linear structure.
+    lambda0 = np.ones(N, dtype=np.float32) * 1e-4  # Initialize with small value
+
+    voxel2idx, _ = _compute_voxel_occupancies(coords, voxel_size=cluster_voxel)
+
+    for key, idx_list in voxel2idx.items():
+        idxs = np.array(idx_list, dtype=np.int32)
+        if idxs.size < 5:  # Need at least 5 points for a stable PCA estimate
+            continue
+
+        pts = coords[idxs]
+        centroid = pts.mean(axis=0)
+        cov = (pts - centroid).T @ (pts - centroid)
+
+        try:
+            # SVD: s contains the square roots of the eigenvalues (or eigenvalues if using np.linalg.eig)
+            # np.linalg.svd returns singular values, which relate to eigenvalues (s^2 = lambda)
+            u, s, vt = np.linalg.svd(cov)
+
+            # Eigenvalues are related to singular values squared: lambda = s^2
+            eigenvalues = np.sort(s ** 2)
+
+            # Smallest eigenvalue (lambda_0) is the measure of flatness/linearity
+            # We use it directly: Small lambda_0 means high structure
+            lambda0[idxs] = eigenvalues[0].astype(np.float32)
+
+        except Exception:
+            # Fallback for numerical instability
+            continue
+
+    # 归一化 lambda0 (曲率)
+    # 使用 max(lambda0) 而不是 max(lambda0[lambda0 > 0]) 来避免极值
+    lambda0_norm = lambda0 / (np.max(lambda0) + 1e-8)
+
+    # 结构强度 (Structure Strength): 1 - Curvature_norm
+    # 结构强度越高 (接近1)，则曲率越低 (越平面/边缘)，需要保护
+    structure_strength = 1.0 - lambda0_norm
+
+    # 保证强度在 [0, 1] 范围内
+    return np.clip(structure_strength, 0.0, 1.0)
+
+
 # ---------------------------------------------------------------------
-# 2) Distance-biased Point Drop (DBPD)
+# 2) Semantic Aware Point Drop (SAPD) Function
 # ---------------------------------------------------------------------
+
+def apply_semantic_aware_point_drop(
+        block: np.ndarray,
+        labels: np.ndarray,
+        ids: np.ndarray,
+        config: Dict[str, Any]
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    语义结构感知丢点 (SAPD)。
+    结合了距离偏置丢点 (DBPD) 和结构支撑保护。
+    """
+    cfg = config.get('semantic_aware_point_drop', {})
+    rng = np.random
+
+    # 框架级参数
+    p_frame = cfg.get('prob', 0.2)
+    base_drop = cfg.get('base_drop', 0.04)
+    max_drop = cfg.get('max_drop', 0.2)
+    density_voxel_size = cfg.get('density_voxel_size', 2.0)
+    gamma = cfg.get('gamma', 0.3)
+    r_scale = cfg.get('r_scale', 60.0)
+
+    # 保护参数
+    protect_classes = cfg.get('protect_small_classes', [])
+    protect_scale = cfg.get('protect_scale', 0.5)
+    # 新增：几何保护因子 (Structure Protection Factor)
+    geo_protect_factor = cfg.get('geo_protect_factor', 0.7)  # 结构越强，丢点概率降低的程度
+
+    if rng.rand() > p_frame or block.shape[0] == 0:
+        return block, labels, ids
+
+    coords = block[:, :3].copy()
+    N = coords.shape[0]
+
+    # --- Step 1: 距离偏置丢点概率 (Distance-Biased Drop Prob) ---
+    R = np.linalg.norm(coords, axis=1)
+    # 基于距离的权重 (远距离点权重高)
+    dist_weight = np.clip(R / r_scale, 0.0, 1.0)
+
+    # 基础丢点概率: P_drop_base = base + (max - base) * W_dist
+    drop_prob = base_drop + (max_drop - base_drop) * dist_weight
+
+    # --- Step 2: 几何结构感知保护 (Geometry-Aware Protection) ---
+    # 计算点的结构强度 (Structure Strength: 0=噪声/弱结构, 1=平面/边缘)
+    structure_strength = _compute_structure_strength(coords, cluster_voxel=density_voxel_size)
+
+    # 结构感知保护因子: 结构越强 (接近1)，保护因子越小 (丢点概率被更多地降低)
+    # P_drop_geo = P_drop_base * [1 - geo_protect_factor * Structure_Strength]
+    # 例: 结构强度=1, geo_protect_factor=0.7 -> P_drop_geo = P_drop_base * 0.3 (丢点概率降至30%)
+    # 例: 结构强度=0, geo_protect_factor=0.7 -> P_drop_geo = P_drop_base * 1.0 (不保护)
+    protection_mask = 1.0 - geo_protect_factor * structure_strength
+    drop_prob *= protection_mask
+
+    # --- Step 3: 小物体类别保护 (Small Class Protection) ---
+    if labels is not None and protect_classes:
+        small_mask = np.isin(labels, np.array(protect_classes, dtype=labels.dtype))
+        drop_prob[small_mask] *= protect_scale
+
+    # --- Step 4: 随机采样丢弃 ---
+    keep_mask = rng.rand(N) > drop_prob
+
+    # 保证至少保留一个点，防止空帧
+    if keep_mask.sum() == 0:
+        keep_mask[rng.randint(0, N)] = True
+
+    # 应用 mask
+    block_out = block[keep_mask]
+    labels_out = labels[keep_mask]
+    ids_out = ids[keep_mask]
+
+    return block_out, labels_out, ids_out
+
+
 def apply_distance_biased_point_drop(block: np.ndarray, labels: np.ndarray, ids: np.ndarray, config: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Distance-biased point drop: far & sparse regions more likely to be dropped.
@@ -582,161 +579,174 @@ def apply_occlusion_patch(block: np.ndarray, labels: np.ndarray, ids: np.ndarray
     ids_out = ids[keep_mask] if ids is not None else ids
     return block_out, labels_out, ids_out
 
+def angle_in_range(phi, low, high):
+    """Checks if angle phi is in range [low, high], handling the +/- pi wrap-around."""
+    diff = (phi - low) % (2 * np.pi)
+    range_width = (high - low) % (2 * np.pi)
+    return diff <= range_width
 
-import torch
-import torch.nn.functional as F
-import math
-from typing import Dict, Any, Tuple
-
-# 注意：此函数假设输入 'coords', 'features', 'labels', 'logits', 'entropy' 均为 PyTorch Tensor 且已在同一设备上。
-
-things_class_ids = torch.tensor([0, 1, 2, 3, 4, 5, 6, 7, 13, 17, 18], dtype=torch.long)
-
-
-def _compute_voxel_occupancies_tensor(coords: torch.Tensor, voxel_size: float) -> torch.Tensor:
+def apply_nonuniform_region_perturbation(block: np.ndarray, labels: np.ndarray, ids: np.ndarray,
+                                         config: Dict[str, Any]) -> \
+        Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    高性能 Tensor-based 计算体素占用密度 (point-wise density count)。
-    输入:
-        coords: (N,3) 浮点坐标
-        voxel_size: float, 体素尺寸
-    输出:
-        point_density: (N,) 每个点对应体素的点数量
+    NRP: 非均匀区域扰动增强 (Non-uniform Region Perturbation)
+    包含 DSP (深度选择性扰动) 和 SSP (扫描线选择性扰动).
     """
-    device = coords.device
+    cfg = config.get('nonuniform_region_perturbation', {})
+    rng = np.random
+
+    if block is None or block.shape[0] == 0 or rng.rand() > cfg.get('prob', 1.0):
+        return block, labels, ids
+
+    coords = block[:, :3].copy()
     N = coords.shape[0]
 
-    # 1. 量化到体素索引
-    voxel_indices = torch.floor(coords / voxel_size).to(torch.int32)  # (N,3)
+    # --------------------------------------------------------
+    # (1) 深度选择性扰动 (DSP)
+    # --------------------------------------------------------
+    dsp_cfg = cfg.get('depth_selective_perturbation', {})
+    if rng.rand() < dsp_cfg.get('prob', 0.5):
+        dists = np.linalg.norm(coords, axis=1)
 
-    # 2. 将体素索引转换成唯一 linear key
-    max_coords = voxel_indices.max(dim=0).values + 1  # 每维度最大值 +1
-    key = voxel_indices[:, 0]
-    key = key * max_coords[1] + voxel_indices[:, 1]
-    key = key * max_coords[2] + voxel_indices[:, 2]  # (N,)
+        # 动态选择深度区间
+        d_min_cfg, d_max_cfg = dsp_cfg.get('d_range', [20.0, 80.0])
+        # 随机选择一个漂移区间 [d_l, d_h]
+        d_l = rng.uniform(d_min_cfg, d_max_cfg - 10)
+        d_h = rng.uniform(d_l + 5, d_max_cfg)
 
-    # 3. 使用 scatter_add 统计每个体素的点数量
-    unique_keys, inverse = torch.unique(key, return_inverse=True)  # inverse: (N,) 指向 unique_keys idx
-    counts = torch.zeros_like(unique_keys, dtype=torch.float, device=device)
-    counts.scatter_add_(0, inverse, torch.ones_like(inverse, dtype=torch.float, device=device))
+        # 选取在该深度区间内的点
+        depth_mask = (dists >= d_l) & (dists <= d_h)
+        sel_coords = coords[depth_mask]
 
-    # 4. 将统计结果映射回每个点
-    point_density = counts[inverse]  # (N,)
-    return point_density
+        if sel_coords.shape[0] > 0:
+            sel_dists = dists[depth_mask]  # 这是一个长度为 M 的向量
+            base_std = dsp_cfg.get('base_std', 0.01)
+            dist_factor = dsp_cfg.get('dist_factor', 0.0001)
+
+            # 计算深度依赖的 sigma (远距离扰动更大)
+            sigma_vector = base_std + dist_factor * sel_dists
+            epsilon = rng.normal(loc=0., scale=sigma_vector[:, None], size=sel_coords.shape).astype(np.float32)
+
+            coords[depth_mask] += epsilon
+
+    # --------------------------------------------------------
+    # (2) 扫描线选择性扰动 (SSP)
+    # --------------------------------------------------------
+    ssp_cfg = cfg.get('scanline_selective_perturbation', {})
+    if rng.rand() < ssp_cfg.get('prob', 0.3):
+
+        # 转换为极坐标 (计算角度)
+        rho = np.linalg.norm(coords[:, :2], axis=1)
+        phi = np.arctan2(coords[:, 1], coords[:, 0])  # 角度
+
+        num_segments = ssp_cfg.get('num_segments', 3)
+        angle_width = ssp_cfg.get('angle_width', np.pi / 36)  # 5度
+
+        for _ in range(num_segments):
+            # 随机选择一个中心角度
+            theta_c = rng.uniform(-np.pi, np.pi)
+            theta_l = theta_c - angle_width / 2
+            theta_h = theta_c + angle_width / 2
+
+            # 选取在该角度区间内的点 (环绕处理)
+            angle_mask = angle_in_range(phi, theta_l, theta_h)
+
+            sel_coords = coords[angle_mask]
+
+            if sel_coords.shape[0] > 0:
+                ssp_std = ssp_cfg.get('ssp_std', 0.02)
+                # 施加高斯扰动
+                epsilon = rng.normal(loc=0., scale=ssp_std, size=sel_coords.shape).astype(np.float32)
+                coords[angle_mask] += epsilon
+
+    block[:, :3] = coords
+    return block, labels, ids
 
 
-def apply_entropy_guided_point_drop_batch(
-        coords: torch.Tensor,        # (N,4) 最后一列 batch_idx
-        features: torch.Tensor,      # (N,D)
-        labels: torch.Tensor,        # (N,)  或 None
-        config: dict = None,
-        logits: torch.Tensor = None, # (N,C)
-        entropy: torch.Tensor = None # (N,)
-) -> tuple:
+def apply_depth_adaptive_sparsity_augmentation(block: np.ndarray, labels: np.ndarray, ids: np.ndarray,
+                                               config: Dict[str, Any]) -> \
+        Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    支持 batch 的 EGPD（Entropy-Guided Point Drop），返回:
-      coords_out, features_out, labels_out, keep_mask
-
-    - coords: (N,4) 最后一列为 batch_idx（int）
-    - features: (N, D)
-    - labels: (N,) 或 None
-    - logits: (N, C) - 用于计算熵权重（必须与 entropy 一致）
-    - entropy: (N,)  - 若已传入 logits 也可以用 logits 计算 entropy
-
-    返回:
-      coords_out: coords[keep_mask]  (M,4)
-      features_out: features[keep_mask] (M,D)
-      labels_out: labels[keep_mask] (M,) 或 None
-      keep_mask: boolean mask of shape (N,), dtype=torch.bool, device=coords.device
-
-    注意：keep_mask 是布尔 mask（True 表示保留该点），**不是**索引列表。
+    DSA: 深度自适应点稀疏增强 (Depth-adaptive Sparsity Augmentation)
+    包含 D-Drop (深度自适应点丢失) 和 Clustered-Drop (局部簇状点丢失).
     """
-    if config is None:
-        config = {}
+    cfg = config.get('depth_adaptive_sparsity_augmentation', {})
+    rng = np.random
 
-    device = coords.device
-    assert coords.dim() == 2 and coords.shape[1] >= 4, "coords must be (N, >=4)"
+    if block is None or block.shape[0] == 0 or rng.rand() > cfg.get('prob', 1.0):
+        return block, labels, ids
+
+    coords = block[:, :3].copy()
+    current_labels = labels.copy()
+    current_ids = ids.copy()
     N = coords.shape[0]
 
-    if features is None:
-        raise ValueError("features must be provided")
-    if features.shape[0] != N:
-        raise ValueError("features length must match coords")
+    # 初始化总的保留掩码 (True表示保留)
+    keep_mask = np.ones(N, dtype=bool)
 
-    if labels is not None and labels.shape[0] != N:
-        raise ValueError("labels length must match coords")
+    # --------------------------------------------------------
+    # (1) 深度自适应点丢失 (D-Drop)
+    # --------------------------------------------------------
+    ddrop_cfg = cfg.get('depth_aware_drop', {})
+    if rng.rand() < ddrop_cfg.get('prob', 0.6):
+        dists = np.linalg.norm(coords, axis=1)
+        d_min = ddrop_cfg.get('d_min', 0.5)
+        d_max = ddrop_cfg.get('d_max', 100.0)  # 假设最大感知距离
+        alpha = ddrop_cfg.get('alpha', 0.4)  # 最大丢弃概率系数
 
-    # config defaults
-    base_drop = config.get('base_drop', 0.04)
-    max_drop = config.get('max_drop', 0.5)
-    r_scale = config.get('r_scale', 60.0)
-    gamma = config.get('gamma', 0.3)
-    density_voxel = config.get('density_voxel_size', 2.0)
-    protect_small_classes = config.get('protect_small_classes', None)
-    protect_scale = config.get('protect_scale', 0.5)
+        # 归一化距离 [0, 1]
+        dist_norm = (dists - d_min) / (d_max - d_min + 1e-6)
+        dist_norm = np.clip(dist_norm, 0.0, 1.0)
 
-    # coords 分解
-    coords_xyz = coords[:, :3]
-    batch_idx = coords[:, 3].long()  # (N,)
+        # 深度自适应丢弃概率 p_drop(d)
+        p_drop = alpha * dist_norm
 
-    # 距离偏置（标量张量）
-    dists = torch.linalg.norm(coords_xyz, dim=1)  # (N,)
-    dist_weight = 1.0 / (1.0 + torch.exp(- (dists / r_scale - 0.5) * 6.0))
+        # 仅对 D-Drop 产生的点进行丢弃
+        ddrop_mask = rng.rand(N) > p_drop
+        keep_mask &= ddrop_mask  # 整合到总掩码
 
-    # 密度偏置：调用外部函数 _compute_voxel_occupancies_tensor
-    # 该函数应返回 per-point 的 density 值 (N,)
-    densities = _compute_voxel_occupancies_tensor(coords_xyz, density_voxel)
-    # 防止常数分母
-    densities = (densities - densities.min()) / (densities.max() - densities.min() + 1e-6)
+    # --------------------------------------------------------
+    # (2) 局部簇状点丢失 (Clustered-Drop)
+    # --------------------------------------------------------
+    cdrop_cfg = cfg.get('clustered_drop', {})
+    if rng.rand() < cdrop_cfg.get('prob', 0.4):
+        num_clusters = cdrop_cfg.get('num_clusters', 2)
+        radius = cdrop_cfg.get('radius', 1.5)
 
-    # 基础丢弃概率
-    drop_prob_base = base_drop + (max_drop - base_drop) * dist_weight
-    drop_prob_base = torch.clamp(drop_prob_base + gamma * (1.0 - densities), 0.0, 1.0)
+        for _ in range(num_clusters):
+            # 随机选择一个中心点 p_c
+            if keep_mask.sum() == 0:
+                break
 
-    # 熵引导权重（如果 entropy 未提供但传入 logits，可计算）
-    if entropy is None:
-        if logits is None:
-            raise ValueError("Either entropy or logits must be provided")
-        num_classes = logits.shape[1]
-        probs = torch.softmax(logits, dim=1)
-        log_probs = torch.log_softmax(logits, dim=1)
-        entropy = -torch.sum(probs * log_probs, dim=1)  # (N,)
-    else:
-        if entropy.shape[0] != N:
-            raise ValueError("entropy length must match coords")
+            active_coords = coords[keep_mask]
+            center_idx_in_active = rng.randint(0, active_coords.shape[0])
+            p_c = active_coords[center_idx_in_active]
 
-    num_classes = logits.shape[1] if logits is not None else max(2, int(config.get('num_classes', 2)))
-    W_entropy = 1.0 - (entropy / (torch.log(torch.tensor(float(num_classes), device=device)) + 1e-6))
-    W_entropy = torch.clamp(W_entropy, 0.0, 1.0)
+            # 计算距离并创建新的丢弃掩码
+            dists_to_center = np.linalg.norm(coords - p_c, axis=1)
+            # cluster_drop_mask: True表示要丢弃 (即 keep_mask 设为 False)
+            cluster_drop_mask = dists_to_center < radius
 
-    final_drop_prob = drop_prob_base * W_entropy
-    final_drop_prob = torch.clamp(final_drop_prob, 0.0, 1.0)
+            # 将簇状丢弃应用到总保留掩码
+            keep_mask[cluster_drop_mask] = False
 
-    # 类别保护（如果需要）
-    if protect_small_classes is not None and labels is not None:
-        # protect_small_classes 可以是 list/tuple/ndarray
-        small_cls_tensor = torch.tensor(list(protect_small_classes), device=device, dtype=labels.dtype)
-        small_mask = torch.isin(labels, small_cls_tensor)
-        final_drop_prob[small_mask] *= float(protect_scale)
-        final_drop_prob = torch.clamp(final_drop_prob, 0.0, 1.0)
+    # --------------------------------------------------------
+    # (3) 应用总保留掩码并返回
+    # --------------------------------------------------------
+    block_original = block.copy()
+    labels_original = labels.copy()
+    ids_original = ids.copy()
 
-    # 随机采样决定保留（布尔 mask）
-    keep_mask = (torch.rand_like(final_drop_prob) > final_drop_prob).to(torch.bool)
-
-    # 如果整个 batch 一个也没保留 -> 为每个场景(每个 batch_idx)至少保留一个点（更稳妥）
+    # 确保至少保留一个点
     if keep_mask.sum() == 0:
-        unique_batches = torch.unique(batch_idx)
-        for b in unique_batches:
-            b_idx = (batch_idx == b).nonzero(as_tuple=False).squeeze(1)
-            if b_idx.numel() > 0:
-                sel = b_idx[torch.randint(0, b_idx.numel(), (1,), device=device)]
-                keep_mask[sel] = True
+        keep_mask[rng.randint(0, N)] = True
+    N = block_original.shape[0]
+    MIN_RATIO_THRESHOLD = 0.05
+    N_kept = keep_mask.sum()
+    if N_kept / N < MIN_RATIO_THRESHOLD:
+        return block_original, labels_original, ids_original
+    block_out = block[keep_mask]
+    labels_out = current_labels[keep_mask]
+    ids_out = current_ids[keep_mask]
 
-    # 最终保留下来的输出
-    coords_out = coords[keep_mask]
-    features_out = features[keep_mask]
-    labels_out = labels[keep_mask] if labels is not None else None
-
-    # 确保返回 keep_mask 是 torch.bool、device 与输入一致
-    keep_mask = keep_mask.to(device=device, dtype=torch.bool)
-
-    return coords_out, features_out, labels_out, keep_mask
+    return block_out, labels_out, ids_out

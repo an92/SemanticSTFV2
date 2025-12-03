@@ -53,9 +53,9 @@ def get_aug_single_kitti(phase):
 
 
 def get_aug_single_kittiV1(phase):
-    from core.datasets import SingleAugSemanticKITTIV1
+    from core.datasets import SingleAugSemanticV1KITTI
     dataset_config = configs.src_dataset if phase == 'train' else configs.tgt_dataset
-    dataset = SingleAugSemanticKITTIV1(root=dataset_config.root, num_points=dataset_config.num_points, voxel_size=dataset_config.voxel_size, strong_aug=dataset_config.get('strong_aug'))
+    dataset = SingleAugSemanticV1KITTI(root=dataset_config.root, num_points=dataset_config.num_points, voxel_size=dataset_config.voxel_size, strong_aug=dataset_config.get('strong_aug'))
 
     return dataset[phase]
 

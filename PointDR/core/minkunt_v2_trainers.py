@@ -1,10 +1,9 @@
 import numpy as np
 import torch
-from torch import nn
 from torch.cuda import amp
 from torchpack.train import Trainer
 from torchpack.utils.typing import Optimizer, Scheduler
-import torch.nn.functional as F
+import torch.nn as nn
 
 import time
 from typing import Any, Dict, List, Optional, Callable
@@ -21,56 +20,75 @@ import tqdm
 __all__ = ['MinkUnetV2Trainer']
 
 
-def dg_uncertainty_weight(
-    logits: torch.Tensor,
-    dim: int = 1,
-    epoch_num: int = 1,
-    alpha_init: float = 0.5,
-    alpha_rate: float = 0.05,
-    alpha_max: float = 2.5,
-) -> torch.Tensor:
-    alpha_t = min(alpha_max, alpha_init + epoch_num * alpha_rate)
+class CategoryChannelSensitivity:
+    """
+    类别-通道敏感矩阵 (CCSM)
+    用于抑制对 source 域特定的 channel，从而提升 DG 泛化能力
+    """
 
-    probs = F.softmax(logits, dim=dim)
+    def __init__(self, num_classes, feature_dim, reduction=0.8, device='cuda'):
+        """
+        Args:
+            num_classes: 类别数
+            feature_dim: 特征维度（channel数）
+            reduction: 高敏感通道抑制比例
+        """
+        self.num_classes = num_classes
+        self.feature_dim = feature_dim
+        self.reduction = reduction
+        self.device = device
+        # 保存每个类别每个通道的重要性
+        self.registered_importance = torch.zeros(num_classes, feature_dim, device=device)
 
-    # 2. 计算熵 (Entropy)
-    # torch.log(probs + 1e-8) 确保对数计算的稳定性
-    entropy = -torch.sum(probs * torch.log(probs + 1e-8), dim=dim)
+    @torch.no_grad()
+    def update_importance(self, features, targets):
+        """
+        统计当前 batch 每个类别每个通道的平均激活
+        Args:
+            features: [N, C] 特征
+            targets: [N] 类别标签
+        """
+        for c in range(self.num_classes):
+            mask = (targets == c)
+            if mask.sum() > 0:
+                self.registered_importance[c] = features[mask].abs().mean(0)
 
-    # 3. 计算最大熵 (Max_Entropy)
-    C = logits.size(dim)
-    max_entropy = torch.log(torch.tensor(C, dtype=logits.dtype, device=logits.device) + 1e-8)
+    def compute_weights(self, targets, percentile=80):
+        """
+        根据统计的 importance 生成通道权重
+        对敏感通道做轻度衰减
+        Args:
+            targets: [N] batch 中每个点的类别
+            percentile: top k% 高敏感通道被抑制
+        Returns:
+            weights: [N, C] 点特征通道权重
+        """
+        N, C = targets.shape[0], self.feature_dim
+        weights = torch.ones((N, C), device=self.device)
 
-    # # 4. Soft Weighting 公式: 1 + alpha * (Entropy / Max_Entropy)
-    # normalized_entropy = entropy / max_entropy
-    # weight = 1.0 + alpha * normalized_entropy
-    normalized_entropy = entropy / max_entropy
-    weight = torch.exp(-alpha_t * normalized_entropy)
+        for c in range(self.num_classes):
+            mask = (targets == c)  # [N]
+            if mask.sum() == 0:
+                continue
+            th = torch.quantile(self.registered_importance[c], percentile / 100.0)
+            ch_mask = self.registered_importance[c] >= th  # [C]
 
-    return weight.detach()
+            # 扩展 mask 用于广播
+            mask_expand = mask.unsqueeze(1)  # [N, 1]
+            ch_mask_expand = ch_mask.unsqueeze(0)  # [1, C]
+            combined_mask = mask_expand & ch_mask_expand  # [N, C]
 
+            weights[combined_mask] *= self.reduction
 
-class GradientReversal(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x, lambda_):
-        ctx.lambda_ = lambda_
-        return x.view_as(x)
+        return weights
 
-    @staticmethod
-    def backward(ctx, grad_output):
-        return grad_output.neg() * ctx.lambda_, None
+    def apply_weights(self, features, targets, percentile=80):
+        """
+        应用通道权重到特征
+        """
+        weights = self.compute_weights(targets, percentile)
+        return features * weights
 
-class DomainClassifier(nn.Module):
-    def __init__(self, feat_dim: int, num_domains: int):
-        super().__init__()
-        self.fc = nn.Sequential(
-            nn.Linear(feat_dim, 128),
-            nn.ReLU(),
-            nn.Linear(128, num_domains)
-        )
-
-    def forward(self, x):
-        return self.fc(x)
 
 class MinkUnetV2Trainer(Trainer):
 
@@ -83,10 +101,8 @@ class MinkUnetV2Trainer(Trainer):
         num_workers: int,
         seed: int,
         amp_enabled: bool = False,
-        alpha_init: float = 0.5,
-        alpha_rate: float = 0.05,
-        alpha_max: float = 2.5,
-        lamda: float = 0.1,
+        reduction: float = 0.8,
+        percentile: int = 80,
     ) -> None:
         self.model = model
         self.criterion = criterion
@@ -99,20 +115,17 @@ class MinkUnetV2Trainer(Trainer):
         self.epoch_num = 1
 
         self.eval_interval = 500
-
         self.ignore_label = 255
-
-        self.alpha_init = alpha_init
-        self.alpha_rate = alpha_rate
-        self.alpha_max = alpha_max
-        self.feature_dim = 48
         self.num_classes = 19
-        self.T = 0.07
-        self.proto_momentum = 0.99
-        self.lambda_ = lamda
+        self.feature_dim = 48
+        self.reduction = reduction
+        self.percentile = percentile
 
-        self.criterion_reduction_none = nn.CrossEntropyLoss(ignore_index=self.ignore_label, reduction='none')
-        self.register_buffer("global_prototypes", torch.zeros(self.num_classes, self.feature_dim))
+        self.ccsm = CategoryChannelSensitivity(
+            num_classes=self.num_classes,
+            feature_dim=self.feature_dim,
+            reduction=self.reduction,
+        )
 
     def _before_epoch(self) -> None:
         self.model.train()
@@ -131,67 +144,18 @@ class MinkUnetV2Trainer(Trainer):
 
         with amp.autocast(enabled=self.amp_enabled):
 
-            outputs, feat_1 = self.model(inputs)
+            outputs, feat = self.model(inputs)
 
             if outputs.requires_grad:
-                inputs_2 = _inputs['lidar_2']
-                targets_2 = feed_dict['targets_2'].F.long().cuda(non_blocking=True)
-
-                valid_mask = targets != self.ignore_label
-                # --- 1. CE loss with uncertainty weight (Main Loss) ---
-                logits_v = outputs[valid_mask]
-                targets_v = targets[valid_mask]
-                feat_1_v = feat_1[valid_mask]  # 取出有效点的特征
-
-                loss_ce_per_point = self.criterion_reduction_none(logits_v, targets_v)
-
-                weight_v = dg_uncertainty_weight(
-                    logits_v,
-                    dim=1,
-                    epoch_num=self.epoch_num,
-                    alpha_init=self.alpha_init,
-                    alpha_rate=self.alpha_rate,
-                    alpha_max=self.alpha_max,
-                )
-                den = weight_v.sum().clamp_min(1.0)
-                loss_main = (loss_ce_per_point * weight_v).sum() / den
-                feat_1_norm = F.normalize(feat_1_v, dim=1)
-
                 with torch.no_grad():
-                    # 遍历所有类别，计算并更新全局原型
-                    for c in range(self.num_classes):
-                        c_mask = targets_v == c
-                        if c_mask.sum() > 0:
-                            c_feats = feat_1_norm[c_mask]
-                            # 核心改动：使用可靠性权重，降低噪声点对原型的影响
-                            c_weights = weight_v[c_mask].view(-1, 1)
+                    self.ccsm.update_importance(feat.detach(), targets)
 
-                            # Step A: 计算当前 Batch 的加权平均原型
-                            weighted_mean = (c_feats * c_weights).sum(0) / (c_weights.sum() + 1e-8)
-
-                            # Step B: 核心改动：动量更新全局原型
-                            self.global_prototypes[c] = self.proto_momentum * self.global_prototypes[c] + \
-                                                        (1 - self.proto_momentum) * weighted_mean
-
-                # --- 3. Prototype Alignment Loss (Loss Content) ---
-                _, feat_2 = self.model(inputs_2)
-                feat_2 = F.normalize(feat_2, dim=1)
-
-                # 使用稳定且干净的全局原型进行对齐
-                clean_protos = F.normalize(self.global_prototypes, dim=1).detach()
-
-                # logits_content: 点到类原型相似度
-                logits_content = torch.matmul(feat_2, clean_protos.T) / self.T
-                loss_content = self.criterion(logits_content, targets_2)
-
-                # 总 loss
-                loss = loss_main + self.lambda_ * loss_content
+                feat_weighted = self.ccsm.apply_weights(feat, targets,percentile=self.percentile)
+                outputs_weighted = self.model.classifier(feat_weighted)
+                loss = self.criterion(outputs_weighted, targets)
 
         if outputs.requires_grad:
             self.summary.add_scalar('loss', loss.item())
-            self.summary.add_scalar('loss_main', loss_main.item())
-            self.summary.add_scalar('loss_content', loss_content.item())
-
 
             self.optimizer.zero_grad()
             self.scaler.scale(loss).backward()
@@ -199,7 +163,7 @@ class MinkUnetV2Trainer(Trainer):
             self.scaler.update()
             self.scheduler.step()
             return {
-                'outputs': outputs,
+                'outputs': outputs_weighted,
                 'targets': targets,
             }
         else:

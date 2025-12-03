@@ -13,8 +13,9 @@ from PointDR.core.datasets.settings import kept_labels, label_name_mapping
 from PointDR.core.datasets.transform_3d import apply_rotate_scale, \
     apply_random_jittering, apply_random_drop_out, apply_add_noise_points, \
     apply_flip_axis, apply_intensity_channel_distortion, apply_physical_attenuation_model, \
-    apply_selective_range_jittering, apply_weather_layered_augmentation, apply_geometry_selective_jitter, \
-    apply_distance_biased_point_drop, apply_intensity_jitter,  apply_occlusion_patch
+    apply_selective_range_jittering,  apply_geometry_selective_jitter, \
+    apply_distance_biased_point_drop, apply_intensity_jitter, apply_occlusion_patch, apply_semantic_aware_point_drop, \
+    apply_depth_adaptive_sparsity_augmentation, apply_nonuniform_region_perturbation
 
 AUG_MAP = {
     'rotate_scale': apply_rotate_scale,
@@ -25,11 +26,13 @@ AUG_MAP = {
     'intensity_channel_distortion': apply_intensity_channel_distortion,
     'physical_attenuation_model': apply_physical_attenuation_model,
     'selective_range_jittering': apply_selective_range_jittering,
-    'weather_layered_augmentation': apply_weather_layered_augmentation,
     'geometry_selective_jitter': apply_geometry_selective_jitter,
     'distance_biased_point_drop': apply_distance_biased_point_drop,
     'intensity_jitter': apply_intensity_jitter,
     'occlusion_patch': apply_occlusion_patch,
+    'semantic_aware_point_drop': apply_semantic_aware_point_drop,
+    'depth_adaptive_sparsity_augmentation': apply_depth_adaptive_sparsity_augmentation,
+    'nonuniform_region_perturbation': apply_nonuniform_region_perturbation,
 }
 
 
@@ -199,7 +202,6 @@ class SingleAugSemanticKITTIInternal:
 
     def __getitem__(self, index):
         return self.return_aug_single_views(index)
-
 
     @staticmethod
     def collate_fn(inputs):

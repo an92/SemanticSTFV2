@@ -6,6 +6,11 @@ data:
 model:
   name: minkunet
   cr: 0.5
+  geo_weight: 0.01
+  conf_threshold: 0.95
+  knn_k: 16
+  consis_ratio: 0.8
+  r_scale: 50
 
 train:
   seed: 1588147245
@@ -83,7 +88,7 @@ tgt_dataset:
   num_points: 80000
   voxel_size: 0.05
 
-num_epochs: 50
+num_epochs: 30
 batch_size: 8
 
 criterion:

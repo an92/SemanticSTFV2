@@ -22,7 +22,18 @@ __all__ = ['RobustTrainer']
 
 class RobustTrainer(Trainer):
 
-    def __init__(self, model: nn.Module, criterion: Callable, optimizer: Optimizer, scheduler: Scheduler, num_workers: int, seed: int, amp_enabled: bool = False) -> None:
+    def __init__(
+        self,
+        model: nn.Module,
+        criterion: Callable,
+        optimizer: Optimizer,
+        scheduler: Scheduler,
+        num_workers: int,
+        seed: int,
+        amp_enabled: bool = False,
+        alpha: float = 0.1,
+        beta: float = 0.1,
+    ) -> None:
         self.model = model
         self.criterion = criterion
         self.optimizer = optimizer
@@ -34,6 +45,8 @@ class RobustTrainer(Trainer):
         self.epoch_num = 1
 
         self.eval_interval = 500
+        self.alpha = alpha
+        self.beta = beta
 
     def _before_epoch(self) -> None:
         self.model.train()
@@ -50,22 +63,47 @@ class RobustTrainer(Trainer):
         inputs = _inputs['lidar']
         targets = feed_dict['targets'].F.long().cuda(non_blocking=True)
 
-        weather_param = {
-            'fog_alpha': 0.3,
-            'drop_rate': 0.2,
-            'intensity_scale': 0.7,
-        }
-        self.model.weather_param = weather_param
-
         with amp.autocast(enabled=self.amp_enabled):
 
             outputs, _ = self.model(inputs)
 
             if outputs.requires_grad:
-                loss = self.criterion(outputs, targets)
+                loss_ce = self.criterion(outputs, targets)
+                if 'structure_strength' in feed_dict:
+                    structure_strength = feed_dict['structure_strength'].F.float().cuda(non_blocking=True)
+                else:
+                    structure_strength = torch.ones_like(targets, dtype=torch.float32)
+
+                # 计算结构感知损失
+                pixel_wise_loss = nn.functional.cross_entropy(outputs, targets, reduction='none', ignore_index=255)
+
+                if structure_strength.shape != pixel_wise_loss.shape:
+
+                    structure_strength = structure_strength[:pixel_wise_loss.shape[0]]
+
+                valid_mask = (targets != 255).float()
+                valid_structure_strength = structure_strength * valid_mask
+
+                # 强结构点 (接近1) 的 Loss 会被保留，弱结构点 (接近0) 的 Loss 会被抑制
+                weighted_loss = pixel_wise_loss * valid_structure_strength
+
+                # 归一化
+                structure_sum = valid_structure_strength.sum() + 1e-6
+                loss_struct_aware = weighted_loss.sum() / structure_sum
+
+                # 弱可见性驱动的不确定性损失
+                prob = torch.softmax(outputs, dim=1)
+                entropy = -(prob * torch.log(prob + 1e-6)).sum(dim=1)
+                weights_unc = (1.0 - valid_structure_strength) * valid_mask
+                loss_uncertainty = (weights_unc * torch.exp(-entropy)).sum() / (weights_unc.sum() + 1e-6)
+
+                loss = loss_ce + self.alpha * loss_struct_aware + self.beta * loss_uncertainty
 
         if outputs.requires_grad:
             self.summary.add_scalar('loss', loss.item())
+            self.summary.add_scalar('loss_ce', loss_ce.item())
+            self.summary.add_scalar('loss_struct_aware', loss_struct_aware.item())
+            self.summary.add_scalar('loss_uncertainty', loss_uncertainty.item())
 
             self.optimizer.zero_grad()
             self.scaler.scale(loss).backward()

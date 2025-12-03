@@ -22,7 +22,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         '--config',
-        default='/home/SemanticSTFV2/PointDR/configs/learner_minkunet.yaml',
+        default='/home/SemanticSTFV2/PointDR/configs/learner.yaml',
         help='config file',
     )
     parser.add_argument('--run-dir', default='minkunet_learner', help='run directory')
@@ -79,9 +79,11 @@ def main() -> None:
         num_workers=configs.workers_per_gpu,
         seed=seed,
         amp_enabled=configs.amp_enabled,
-        thing_weight= configs.model.thing_weight,
-        mu= configs.model.mu,
-        lam= configs.model.lam,
+        geo_weight= configs.model.geo_weight,
+        conf_threshold=configs.model.conf_threshold,
+        knn_k=configs.model.knn_k,
+        consis_ratio=configs.model.consis_ratio,
+        r_scale=configs.model.r_scale,
     )
 
     trainer.train_with_defaults(dataflow['train'],

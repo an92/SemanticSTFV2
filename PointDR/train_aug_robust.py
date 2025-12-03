@@ -79,12 +79,8 @@ def main() -> None:
         num_workers=configs.workers_per_gpu,
         seed=seed,
         amp_enabled=configs.amp_enabled,
-        things_class_ids=configs.model.things_class_ids,
-        things_weights=configs.model.things_weights,
-        stuff_weights=configs.model.stuff_weights,
-        lambda_cl=configs.model.lambda_cl,
-        lambda_gsp=configs.model.lambda_gsp,
-
+        alpha=configs.model.alpha,
+        beta=configs.model.beta,
     )
     trainer.train_with_defaults(
         dataflow['train'],

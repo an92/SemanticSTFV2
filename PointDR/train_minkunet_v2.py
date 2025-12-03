@@ -83,10 +83,8 @@ def main() -> None:
         num_workers=configs.workers_per_gpu,
         seed=seed,
         amp_enabled=configs.amp_enabled,
-        alpha_init=configs.model.alpha_init,
-        alpha_rate=configs.model.alpha_rate,
-        alpha_max=configs.model.alpha_max,
-        lamda = configs.model.lamda,
+        reduction=configs.model.reduction,
+        percentile=configs.model.percentile,
     )
     trainer.train_with_defaults(
         dataflow['train'],
