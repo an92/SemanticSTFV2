@@ -19,6 +19,8 @@ import tqdm
 
 __all__ = ['RobustTrainer']
 
+from PointDR.core.models.semantic_kitti.minkunet_robust import grad_reverse
+
 
 class RobustTrainer(Trainer):
 
@@ -31,8 +33,9 @@ class RobustTrainer(Trainer):
         num_workers: int,
         seed: int,
         amp_enabled: bool = False,
-        alpha: float = 0.1,
-        beta: float = 0.1,
+        alpha: float = 0.5,
+        lamda: float = 0.1,
+        gamma: float = 0.1,
     ) -> None:
         self.model = model
         self.criterion = criterion
@@ -45,8 +48,13 @@ class RobustTrainer(Trainer):
         self.epoch_num = 1
 
         self.eval_interval = 500
-        self.alpha = alpha
-        self.beta = beta
+        self.num_classes = 19
+
+        self.lamda =lamda  # L2
+        self.T = 0.07
+
+        self.alpha = alpha  # L_decouple (L4)
+        self.gamma = gamma  # L_weather (L3)
 
     def _before_epoch(self) -> None:
         self.model.train()
@@ -65,55 +73,60 @@ class RobustTrainer(Trainer):
 
         with amp.autocast(enabled=self.amp_enabled):
 
-            outputs, _ = self.model(inputs)
+            outputs, feat_abstract, feat_W, feat_semantic = self.model(inputs)
 
-            if outputs.requires_grad:
-                loss_ce = self.criterion(outputs, targets)
-                if 'structure_strength' in feed_dict:
-                    structure_strength = feed_dict['structure_strength'].F.float().cuda(non_blocking=True)
+        if outputs.requires_grad:
+
+            loss_seg = self.criterion(outputs, targets)
+
+            feat_abstract_norm = nn.functional.normalize(feat_abstract, dim=1)
+
+            feat_proto = torch.zeros((self.num_classes, feat_abstract_norm.shape[1])).cuda()
+            for cls in range(self.num_classes):
+                mask = (targets == cls)
+                if mask.sum() > 0:
+                    feat_proto[cls] = feat_abstract_norm[mask].mean(dim=0)
                 else:
-                    structure_strength = torch.ones_like(targets, dtype=torch.float32)
+                    feat_proto[cls] = self.model.memo_bank[cls]
 
-                # 计算结构感知损失
-                pixel_wise_loss = nn.functional.cross_entropy(outputs, targets, reduction='none', ignore_index=255)
+            feat_proto_norm = nn.functional.normalize(feat_proto, dim=1).detach()
+            feat_proto_norm = feat_proto_norm.to(feat_abstract_norm.dtype)
 
-                if structure_strength.shape != pixel_wise_loss.shape:
+            logits = torch.mm(feat_abstract_norm, feat_proto_norm.T) / self.T
+            loss_abstract = self.criterion(logits, targets)
 
-                    structure_strength = structure_strength[:pixel_wise_loss.shape[0]]
+            # 3. L_decouple (semantic vs weather/augmentation features)
+            feat_semantic = self.model.dropout(feat_semantic)
+            feat_W_grl = grad_reverse(feat_W, float(self.alpha))
+            S_norm = nn.functional.normalize(feat_semantic, dim=1, eps=1e-6)
+            W_norm = nn.functional.normalize(feat_W_grl, dim=1, eps=1e-6)
 
-                valid_mask = (targets != 255).float()
-                valid_structure_strength = structure_strength * valid_mask
+            # 修正：直接最小化余弦相似度（或最小化互信息代理）
+            # 目标：让 S 和 W 尽可能正交/不相关
+            loss_decouple = torch.mean(torch.sum(S_norm * W_norm, dim=1).abs())  # 最小化绝对值，趋近于0
 
-                # 强结构点 (接近1) 的 Loss 会被保留，弱结构点 (接近0) 的 Loss 会被抑制
-                weighted_loss = pixel_wise_loss * valid_structure_strength
+            # 总 loss
+            loss = loss_seg + self.lamda * loss_abstract + self.gamma * loss_decouple
 
-                # 归一化
-                structure_sum = valid_structure_strength.sum() + 1e-6
-                loss_struct_aware = weighted_loss.sum() / structure_sum
-
-                # 弱可见性驱动的不确定性损失
-                prob = torch.softmax(outputs, dim=1)
-                entropy = -(prob * torch.log(prob + 1e-6)).sum(dim=1)
-                weights_unc = (1.0 - valid_structure_strength) * valid_mask
-                loss_uncertainty = (weights_unc * torch.exp(-entropy)).sum() / (weights_unc.sum() + 1e-6)
-
-                loss = loss_ce + self.alpha * loss_struct_aware + self.beta * loss_uncertainty
+            # log
+            self.summary.add_scalar('loss', loss.item())
+            self.summary.add_scalar('loss_seg', loss_seg.item())
+            self.summary.add_scalar('loss_abstract', loss_abstract.item())
+            self.summary.add_scalar('loss_decouple', loss_decouple.item())
 
         if outputs.requires_grad:
             self.summary.add_scalar('loss', loss.item())
-            self.summary.add_scalar('loss_ce', loss_ce.item())
-            self.summary.add_scalar('loss_struct_aware', loss_struct_aware.item())
-            self.summary.add_scalar('loss_uncertainty', loss_uncertainty.item())
+            self.summary.add_scalar('loss_seg', loss_seg.item())
+            self.summary.add_scalar('loss_abstract', loss_abstract.item())
+            self.summary.add_scalar('loss_decouple', loss_decouple.item())
 
             self.optimizer.zero_grad()
             self.scaler.scale(loss).backward()
             self.scaler.step(self.optimizer)
             self.scaler.update()
             self.scheduler.step()
-            return {
-                'outputs': outputs,
-                'targets': targets,
-            }
+
+            return {'outputs': outputs, 'targets': targets}
         else:
             invs = feed_dict['inverse_map']
             all_labels = feed_dict['targets_mapped']
@@ -134,7 +147,6 @@ class RobustTrainer(Trainer):
                 'outputs': outputs,
                 'targets': targets,
             }
-
     def _after_epoch(self) -> None:
         self.model.eval()
 
@@ -232,7 +244,7 @@ def evaluate(val_loader, model):
                     _inputs[key] = value.cuda()
             inputs = _inputs['lidar']
             # targets = feed_dict['targets'].F.long().cuda(non_blocking=True)
-            outputs = model(inputs)
+            outputs, _, _, _ = model(inputs)
 
             invs = feed_dict['inverse_map']
             all_labels = feed_dict['targets_mapped']

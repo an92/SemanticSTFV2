@@ -1,11 +1,38 @@
+import torch
 import torch.nn as nn
 import torchsparse.nn as spnn
 import torchsparse
+from torch.autograd import Function
+
 
 __all__ = ['MinkUNet_Robust']
 
 from PointDR.core.models.utils import BasicConvolutionBlock, ResidualBlock, BasicDeconvolutionBlock
 
+class GradientReversalLayer(Function):
+    @staticmethod
+    def forward(ctx, x, alpha):
+        ctx.alpha = alpha
+        return x
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return -ctx.alpha * grad_output, None
+
+
+def grad_reverse(x, alpha):
+    return GradientReversalLayer.apply(x, alpha)
+
+class WeatherEncoder(nn.Module):
+    def __init__(self, inc, outc=128):
+        super().__init__()
+        self.net = nn.Sequential(
+            ResidualBlock(inc, inc, ks=3, stride=1, dilation=1),
+            spnn.Conv3d(inc, outc, kernel_size=1, stride=1),
+        )
+
+    def forward(self, x):
+        return self.net(x)
 
 class MinkUNet_Robust(nn.Module):
     def __init__(self, **kwargs):
@@ -79,33 +106,42 @@ class MinkUNet_Robust(nn.Module):
 
         self.classifier = nn.Sequential(nn.Linear(cs[8], kwargs['num_classes']))
 
-        common_channels = cs[8] # 使用最终特征维度 48
-
-        self.point_transforms = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(cs[0], common_channels),
-                nn.BatchNorm1d(common_channels),
-                nn.ReLU(True),
-            ),
-            nn.Sequential(
-                nn.Linear(cs[4], cs[6]),
-                nn.BatchNorm1d(cs[6]),
-                nn.ReLU(True),
-            ),
-            nn.Sequential(
-                nn.Linear(cs[6], cs[8]),
-                nn.BatchNorm1d(cs[8]),
-                nn.ReLU(True),
-            )
-        ])
-
         self.proj = nn.Sequential(
             nn.Linear(cs[8], cs[8]),
             nn.ReLU(inplace=True),
             nn.Linear(cs[8], 128))
 
+        self.E_W = WeatherEncoder(cs[3], 128)
+
+        self.semantic_proj = nn.Sequential(
+            nn.Linear(cs[8], cs[8]),
+            nn.BatchNorm1d(cs[8]),
+            nn.ReLU(True),
+            nn.Linear(cs[8], 128)
+        )
+        self.W_decoder = nn.Sequential(
+            BasicDeconvolutionBlock(128, 128, ks=2, stride=2),  # x3 -> x2 resolution
+            BasicDeconvolutionBlock(128, 128, ks=2, stride=2),  # x2 -> x1 resolution
+            BasicDeconvolutionBlock(128, 128, ks=2, stride=2),  # x1 -> x0/y4 resolution
+        )
+
+        self.m = 0.99  # momentum update rate
+        self.register_buffer("memo_bank", torch.randn(kwargs['num_classes'], 128))
+        self.memo_bank = self.memo_bank * 0.
+
         self.weight_initialization()
         self.dropout = nn.Dropout(0.3, True)
+
+    @torch.no_grad()
+    def momentum_update_key_encoder(self, feat, init=False):
+        """
+        Momentum update of the memo_bank
+        """
+        if init:
+            self.memo_bank = feat
+        else:
+            self.memo_bank = self.memo_bank * self.m + feat * (1. - self.m)
+
 
     def weight_initialization(self):
         for m in self.modules():
@@ -136,7 +172,18 @@ class MinkUNet_Robust(nn.Module):
         y4 = torchsparse.cat([y4, x0])
         y4 = self.up4[1](y4)
 
-        out = self.classifier(y4.F)
-        feat = self.proj(y4.F)
-        return out, feat
+        F_y4 = y4.F
+
+        out = self.classifier(F_y4)
+
+        feat_abstract = self.proj(F_y4)
+
+        feat_semantic = self.semantic_proj(F_y4)  # (N, 128)
+        feat_W_sparse = self.E_W(x3)
+
+        feat_W_upsample = self.W_decoder(feat_W_sparse)
+
+        feat_W = feat_W_upsample.F  # (N, 128)
+
+        return out, feat_abstract, feat_W, feat_semantic
 

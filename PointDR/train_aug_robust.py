@@ -80,7 +80,8 @@ def main() -> None:
         seed=seed,
         amp_enabled=configs.amp_enabled,
         alpha=configs.model.alpha,
-        beta=configs.model.beta,
+        lamda=configs.model.lamda,
+        gamma=configs.model.gamma,
     )
     trainer.train_with_defaults(
         dataflow['train'],

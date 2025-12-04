@@ -77,7 +77,7 @@ class MinkUnetLearnerTrainer(Trainer):
 
         with amp.autocast(enabled=self.amp_enabled):
 
-            outputs, _ = self.model(inputs)
+            outputs, features = self.model(inputs)
 
             if outputs.requires_grad:
                 loss_ce = self.criterion(outputs, targets)
@@ -120,21 +120,20 @@ class MinkUnetLearnerTrainer(Trainer):
                     valid_mask = (targets != 255)
                     hcf_mask = (conf > self.conf_threshold) & valid_mask
 
-                    # 4.2. 联合掩码: (HCF) AND (KNN 连贯性)
-                    final_mask = hcf_mask & (knn_gate.bool())
+                    final_mask = hcf_mask & (knn_gate.bool())  # (N,)
+                    W_gate_E = final_mask[row].float()  # edge 权重
 
+                    W_dist_E = weights_dist[row]
+                    W_E = W_gate_E * W_dist_E
 
-                    if final_mask.any():
-                        entropy = -(prob * torch.log(prob + 1e-6)).sum(dim=1)  # (N,)
+                    features_center = features[row]
+                    features_neighbor = features[col]
+                    feat_diff_sq = ((features_center - features_neighbor) ** 2).sum(dim=1)
 
-                        selected_entropy = entropy[final_mask]
-                        selected_weights = weights_dist[final_mask]
+                    selected_feat_diff = feat_diff_sq * W_E
+                    loss_geo = selected_feat_diff.sum() / (W_E.sum() + 1e-6)
 
-                        loss_geo = (selected_entropy * selected_weights).sum() / (selected_weights.sum() + 1e-6)
-                    else:
-                        loss_geo = torch.zeros(1, device=outputs.device).squeeze()
-
-                    loss = loss_ce + self.geo_weight * loss_geo
+                loss = loss_ce + self.geo_weight * loss_geo
 
         if outputs.requires_grad:
             self.summary.add_scalar('loss', loss.item())
