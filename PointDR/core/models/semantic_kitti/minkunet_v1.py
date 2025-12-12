@@ -11,75 +11,7 @@ from torch_scatter import scatter_mean
 
 from torchsparse import SparseTensor
 
-
-class BasicConvolutionBlock(nn.Module):
-
-    def __init__(self, inc, outc, ks=3, stride=1, dilation=1):
-        super().__init__()
-        self.net = nn.Sequential(
-            spnn.Conv3d(inc,
-                        outc,
-                        kernel_size=ks,
-                        dilation=dilation,
-                        stride=stride),
-            spnn.BatchNorm(outc),
-            spnn.ReLU(True),
-        )
-
-    def forward(self, x):
-        out = self.net(x)
-        return out
-
-
-class BasicDeconvolutionBlock(nn.Module):
-
-    def __init__(self, inc, outc, ks=3, stride=1):
-        super().__init__()
-        self.net = nn.Sequential(
-            spnn.Conv3d(inc,
-                        outc,
-                        kernel_size=ks,
-                        stride=stride,
-                        transposed=True),
-            spnn.BatchNorm(outc),
-            spnn.ReLU(True),
-        )
-
-    def forward(self, x):
-        return self.net(x)
-
-
-class ResidualBlock(nn.Module):
-
-    def __init__(self, inc, outc, ks=3, stride=1, dilation=1):
-        super().__init__()
-        self.net = nn.Sequential(
-            spnn.Conv3d(inc,
-                        outc,
-                        kernel_size=ks,
-                        dilation=dilation,
-                        stride=stride),
-            spnn.BatchNorm(outc),
-            spnn.ReLU(True),
-            spnn.Conv3d(outc, outc, kernel_size=ks, dilation=dilation,
-                        stride=1),
-            spnn.BatchNorm(outc),
-        )
-
-        if inc == outc and stride == 1:
-            self.downsample = nn.Sequential()
-        else:
-            self.downsample = nn.Sequential(
-                spnn.Conv3d(inc, outc, kernel_size=1, dilation=1,
-                            stride=stride),
-                spnn.BatchNorm(outc),
-            )
-
-        self.relu = spnn.ReLU(True)
-
-    def forward(self, x):
-        out = self.relu(self.net(x) + self.downsample(x))
-        return out
+from PointDR.core.models.utils import BasicConvolutionBlock, ResidualBlock, BasicDeconvolutionBlock
 
 
 class MinkUNetV1(nn.Module):
@@ -121,11 +53,6 @@ class MinkUNetV1(nn.Module):
             ResidualBlock(cs[4], cs[4], ks=3, stride=1, dilation=1),
         )
 
-        self.weather_head = nn.Sequential(
-            nn.Linear(cs[4], 64),
-            nn.ReLU(True),
-            nn.Linear(64, 2)  # Binary Classification: 0=Clean, 1=Weather
-        )
 
         self.up1 = nn.ModuleList([
             BasicDeconvolutionBlock(cs[4], cs[5], ks=2, stride=2),
@@ -160,6 +87,11 @@ class MinkUNetV1(nn.Module):
         ])
 
         self.classifier = nn.Sequential(nn.Linear(cs[8], kwargs['num_classes']))
+        self.proj = nn.Sequential(
+            nn.Linear(cs[8], cs[8]),
+            nn.ReLU(inplace=True),
+            nn.Linear(cs[8], 128))
+
 
         self.point_transforms = nn.ModuleList([
             nn.Sequential(
@@ -188,50 +120,14 @@ class MinkUNetV1(nn.Module):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
 
-    def forward(self, x, return_feat=False, force_mask=None):
-        # 1. Encoder Path
+    def forward(self, x):
         x0 = self.stem(x)
         x1 = self.stage1(x0)
         x2 = self.stage2(x1)
         x3 = self.stage3(x2)
-        x4 = self.stage4(x3)  # Bottleneck [N, C]
+        x4 = self.stage4(x3)
 
-        original_x4_feat = x4.F
-
-        # --------------------------------------------------------------
-        # [修复 RuntimeError] 安全计算 Domain Prediction
-        # --------------------------------------------------------------
-        weather_pred = None
-        if x4.C.shape[0] == original_x4_feat.shape[0]:
-            batch_indices = x4.C[:, -1].long()
-            global_feat_tensor = scatter_mean(original_x4_feat, batch_indices, dim=0)
-            weather_pred = self.weather_head(global_feat_tensor)
-        else:
-            pass
-
-        # --------------------------------------------------------------
-        # 2. 特征抑制 (Feature Suppression)
-        # --------------------------------------------------------------
-        if force_mask is not None:
-            masked_feat = original_x4_feat * force_mask
-            # 使用 copy 规避 RuntimeError
-            refined_x4 = copy.copy(x4)
-            refined_x4.F = masked_feat
-        else:
-            refined_x4 = x4
-
-        # 3. G-WOS 模式：返回特征和 Domain Pred
-        if return_feat:
-            # 如果在 return_feat=True 时触发 Bug (极少见)，则必须报错，因为我们需要 pred
-            if weather_pred is None:
-                # 重新尝试强制计算(仅作为最后的手段，通常不会走到这里)
-                batch_indices = x4.C[:, -1].long()[:original_x4_feat.shape[0]]
-                global_feat_tensor = scatter_mean(original_x4_feat, batch_indices, dim=0)
-                weather_pred = self.weather_head(global_feat_tensor)
-
-            return refined_x4, weather_pred, original_x4_feat
-
-        y1 = self.up1[0](refined_x4)
+        y1 = self.up1[0](x4)
         y1 = torchsparse.cat([y1, x3])
         y1 = self.up1[1](y1)
 
@@ -249,5 +145,5 @@ class MinkUNetV1(nn.Module):
 
         out = self.classifier(y4.F)
 
-
-        return out, weather_pred
+        feat = self.proj(y4.F)
+        return out, feat

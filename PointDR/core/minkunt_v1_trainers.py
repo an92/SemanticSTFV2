@@ -4,7 +4,6 @@ from torch import nn
 from torch.cuda import amp
 from torchpack.train import Trainer
 from torchpack.utils.typing import Optimizer, Scheduler
-import torch.nn.functional as F
 
 import time
 from typing import Any, Dict, List, Optional, Callable
@@ -17,38 +16,52 @@ from torchpack.utils import humanize
 from torchpack.utils.logging import logger
 from core.callbacks import MeanIoU
 import tqdm
+import torch.nn.functional as F
+from torch_geometric.nn import knn_graph
 
 __all__ = ['MinkUnetV1Trainer']
 
 
-def dg_uncertainty_weight(
-    logits: torch.Tensor,
-    dim: int = 1,
-    epoch_num: int = 1,
-    alpha_init: float = 0.5,
-    alpha_rate: float = 0.05,
-    alpha_max: float = 2.5,
-) -> torch.Tensor:
-    alpha_t = min(alpha_max, alpha_init + epoch_num * alpha_rate)
+def cosine_smoothness_loss(feat, coords, batch_idx, k=16):
+    loss_smooth = 0.0
+    # 获取坐标和 batch_idx
+    coords = coords[:, :3].float()
+    batch_idx = batch_idx.long()
 
-    probs = F.softmax(logits, dim=dim)
+    for b in batch_idx.unique():
+        mask = batch_idx == b
+        feat_b = feat[mask]
+        coords_b = coords[mask]
 
-    # 2. 计算熵 (Entropy)
-    # torch.log(probs + 1e-8) 确保对数计算的稳定性
-    entropy = -torch.sum(probs * torch.log(probs + 1e-8), dim=dim)
+        # 随机下采样
+        num_points = min(feat_b.shape[0], 20000)
+        if feat_b.shape[0] > num_points:
+            idx_sample = torch.randperm(feat_b.shape[0], device=feat_b.device)[:num_points]
+            feat_b = feat_b[idx_sample]
+            coords_b = coords_b[idx_sample]
 
-    # 3. 计算最大熵 (Max_Entropy)
-    C = logits.size(dim)
-    max_entropy = torch.log(torch.tensor(C, dtype=logits.dtype, device=logits.device) + 1e-8)
+        # 构建 kNN 图
+        edge_index = knn_graph(coords_b, k=k, batch=None)
+        row, col = edge_index
 
-    # # 4. Soft Weighting 公式: 1 + alpha * (Entropy / Max_Entropy)
-    # normalized_entropy = entropy / max_entropy
-    # weight = 1.0 + alpha * normalized_entropy
-    normalized_entropy = entropy / max_entropy
-    weight = torch.exp(-alpha_t * normalized_entropy)
+        # 计算 Cosine Similarity
+        feat_row = feat_b[row]
+        feat_col = feat_b[col]
 
-    return weight.detach()
+        # 归一化每个特征向量
+        feat_row_norm = F.normalize(feat_row, p=2, dim=1)
+        feat_col_norm = F.normalize(feat_col, p=2, dim=1)
 
+        # 计算 Cosine Similarity
+        cosine_sim = (feat_row_norm * feat_col_norm).sum(dim=1)
+
+        # 计算 loss（可以使用 1 - cosine_sim，因为我们想最小化相似度差异）
+        loss_smooth += (1 - cosine_sim).mean()
+
+    # 对于所有批次，计算平均损失
+    loss_smooth /= batch_idx.unique().shape[0]
+
+    return loss_smooth
 
 class MinkUnetV1Trainer(Trainer):
 
@@ -61,9 +74,7 @@ class MinkUnetV1Trainer(Trainer):
         num_workers: int,
         seed: int,
         amp_enabled: bool = False,
-        alpha_init: float = 0.5,
-        alpha_rate: float = 0.05,
-        alpha_max: float = 2.5,
+        alpha: float = 0.2,
     ) -> None:
         self.model = model
         self.criterion = criterion
@@ -79,11 +90,7 @@ class MinkUnetV1Trainer(Trainer):
 
         self.ignore_label = 255
 
-        self.alpha_init = alpha_init
-        self.alpha_rate = alpha_rate
-        self.alpha_max = alpha_max
-
-        self.criterion_reduction_none = nn.CrossEntropyLoss(ignore_index=self.ignore_label, reduction='none')
+        self.alpha = alpha
 
     def _before_epoch(self) -> None:
         self.model.train()
@@ -102,29 +109,23 @@ class MinkUnetV1Trainer(Trainer):
 
         with amp.autocast(enabled=self.amp_enabled):
 
-            outputs, _ = self.model(inputs)
+            outputs, feat = self.model(inputs)
 
             if outputs.requires_grad:
-                valid_mask = targets != self.ignore_label
-                # --- 1. CE loss with uncertainty weight (Main Loss) ---
-                logits_v = outputs[valid_mask]
-                targets_v = targets[valid_mask]
+                loss_seg = self.criterion(outputs, targets)
 
-                loss_ce_per_point = self.criterion_reduction_none(logits_v, targets_v)
+                loss_smooth = 0.0
 
-                weight_v = dg_uncertainty_weight(
-                    logits_v,
-                    dim=1,
-                    epoch_num=self.epoch_num,
-                    alpha_init=self.alpha_init,
-                    alpha_rate=self.alpha_rate,
-                    alpha_max=self.alpha_max,
-                )
-                den = weight_v.sum().clamp_min(1.0)
-                loss = (loss_ce_per_point * weight_v).sum() / den
+                batch_idx = inputs.C[:, -1].long()
+                loss_smooth = cosine_smoothness_loss(feat, coords=inputs.C, batch_idx=batch_idx, k=16)
+
+                loss = loss_seg + self.alpha * loss_smooth
 
         if outputs.requires_grad:
+
             self.summary.add_scalar('loss', loss.item())
+            self.summary.add_scalar('loss_seg', loss_seg.item())
+            self.summary.add_scalar('loss_smooth', loss_smooth.item())
 
             self.optimizer.zero_grad()
             self.scaler.scale(loss).backward()
